@@ -1,5 +1,8 @@
 # Geospatial Embeddings Wrapper
 
+<p align="center">
+  <img src="images/image.png" alt="Geospatial Embeddings Illustration" width="600">
+</p>
 A unified, extensible framework for generating geospatial embeddings from latitude/longitude coordinates using multiple state-of-the-art models.
 
 ## Overview
