@@ -360,8 +360,6 @@ print(f"Output shape: {embeddings.shape}")  # (1, 512)
 - **Input Format**: (latitude, longitude)
 - **Coordinate System**: Equal Earth projection
 - **Encoding Method**: Gaussian Random Fourier Features with multi-scale capsules
-- **Image Encoder**: Frozen CLIP ViT-Large-Patch14
-- **Location Encoder**: Multi-layer MLP (768 → 1024 → 1024 → 1024 → 512)
 - **Embedding Dimension**: 512
 - **Training Data**: MP-16 dataset (4.7M geotagged images from Flickr)
 - **Use Cases**: Image geolocation, finding photo locations, geographic context from visual semantics
