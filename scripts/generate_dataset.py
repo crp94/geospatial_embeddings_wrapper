@@ -1,117 +1,151 @@
 #!/usr/bin/env python3
 """
-Geospatial Embedding Dataset Generator
+Geospatial Embedding Dataset Generator.
 
-Generates uniformly sampled land-only coordinates with geospatial embeddings
-from multiple encoders (GeoCLIP, SatCLIP, etc.) for training location encoders.
-
-Usage:
-    # Generate 100k points with both encoders (default)
-    python generate_dataset.py
-
-    # Generate custom number of points with specific encoders
-    python generate_dataset.py --n_points 50000 --encoders geoclip satclip
-
-    # Generate CSV output without plots
-    python generate_dataset.py --output_format csv --no_plot
-
-    # Use only GeoCLIP
-    python generate_dataset.py --encoders geoclip
-
-Requirements:
-    pip install geopandas shapely pandas torch tqdm requests matplotlib cartopy
+Generates land-only coordinate datasets with embeddings from model-backed encoders
+(GeoCLIP, SatCLIP) and TorchGeo-backed Earth embedding products.
 """
 
-import numpy as np
-import pandas as pd
-import torch
-import geopandas as gpd
-from shapely.geometry import Point
-from shapely.vectorized import contains
-import requests
-import zipfile
-import os
+from __future__ import annotations
+
 import argparse
 import sys
+import warnings
 from pathlib import Path
-from tqdm import tqdm
+
+import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import zipfile
+from shapely.vectorized import contains
+from sklearn.decomposition import FastICA
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeatures
+
     CARTOPY_AVAILABLE = True
 except ImportError:
     CARTOPY_AVAILABLE = False
     print("Warning: Cartopy not available. Maps will use basic matplotlib plots.")
 
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-import warnings
-
 # Add parent directory to path to import wrappers
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from wrappers import GeoEmbeddingEncoder, GeoCLIPEncoder, SatCLIPEncoder
+from wrappers.registry import get_encoder_class, list_encoder_names, normalize_encoder_name
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
+DEFAULT_ENCODERS = ["geoclip", "satclip"]
+
+
+def parse_encoder_roots(values: list[str] | None) -> dict[str, str]:
+    """Parse repeated encoder=path arguments."""
+    roots: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(
+                f"Invalid --encoder_root value '{value}'. Expected encoder=/path/to/data"
+            )
+        raw_name, raw_path = value.split("=", 1)
+        roots[normalize_encoder_name(raw_name)] = raw_path
+    return roots
 
 
 class GeospatialDatasetGenerator:
-    """
-    Generate datasets of land coordinates with geospatial embeddings.
+    """Generate land coordinate datasets with embeddings from multiple backends."""
 
-    Uses the unified embedding interface to support multiple encoders
-    (GeoCLIP, SatCLIP, and any future additions).
-    """
-
-    def __init__(self, cache_dir="./data_cache"):
+    def __init__(
+        self,
+        cache_dir: str = "./data_cache",
+        encoder_roots: dict[str, str] | None = None,
+    ) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.land_mask = None
-        self.encoders = {}
+        self.encoders: dict[str, object] = {}
+        self.encoder_roots = encoder_roots or {}
+        self.rng = np.random.default_rng()
 
-    def initialize_encoders(self, encoder_names=None, device=None):
-        """
-        Initialize embedding encoders.
-
-        Args:
-            encoder_names: List of encoder names ('geoclip', 'satclip').
-                          If None, initializes all available encoders.
-            device: Device to run models on ('cuda', 'cpu', or None for auto-detect)
-        """
+    def initialize_encoders(
+        self, encoder_names: list[str] | None = None, device: str | None = None
+    ) -> dict[str, object]:
+        """Initialize selected encoders from the shared registry."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        available_encoders = {
-            'geoclip': GeoCLIPEncoder,
-            'satclip': SatCLIPEncoder
-        }
-
-        encoders_to_use = encoder_names or list(available_encoders.keys())
+        encoders_to_use = encoder_names or list(DEFAULT_ENCODERS)
+        resolved_names = [normalize_encoder_name(name) for name in encoders_to_use]
 
         print("Initializing encoders...")
-        for encoder_name in encoders_to_use:
-            if encoder_name.lower() not in available_encoders:
-                print(f"Warning: Unknown encoder '{encoder_name}'. Skipping.")
-                continue
+        for encoder_name in resolved_names:
+            encoder_class = get_encoder_class(encoder_name)
+            encoder_root = self.encoder_roots.get(encoder_name)
 
             try:
-                encoder_class = available_encoders[encoder_name.lower()]
-                print(f"  Loading {encoder_name.upper()}...")
-                self.encoders[encoder_name.lower()] = encoder_class(device=device)
-                print(f"  [OK] {encoder_name.upper()} ready "
-                      f"(dim={self.encoders[encoder_name.lower()].get_embedding_dim()})")
-            except Exception as e:
-                print(f"  [ERROR] Could not initialize {encoder_name.upper()}: {e}")
+                print(f"  Loading {encoder_name}...")
+                self.encoders[encoder_name] = encoder_class(
+                    device=device,
+                    data_root=encoder_root,
+                )
+                dim = self.encoders[encoder_name].get_embedding_dim()
+                print(f"  [OK] {encoder_name} ready (dim={dim})")
+            except Exception as exc:
+                print(f"  [ERROR] Could not initialize {encoder_name}: {exc}")
 
         if not self.encoders:
-            raise RuntimeError("No encoders were successfully initialized!")
+            raise RuntimeError("No encoders were successfully initialized.")
 
         print(f"\nActive encoders: {', '.join(self.encoders.keys())}")
         return self.encoders
 
-    def download_land_mask(self):
-        """Download Natural Earth land shapefile for masking"""
+    def resolve_years(self, requested_years: list[int] | None = None) -> list[int | None]:
+        """Resolve which yearly datasets to generate."""
+        if requested_years:
+            requested = sorted(set(requested_years))
+        else:
+            requested = []
+
+        temporal_encoders = {
+            name: encoder
+            for name, encoder in self.encoders.items()
+            if encoder.is_temporal()
+        }
+
+        if not temporal_encoders:
+            return requested or [None]
+
+        if requested:
+            for year in requested:
+                unsupported = [
+                    name
+                    for name, encoder in temporal_encoders.items()
+                    if year not in (encoder.get_available_years() or [])
+                ]
+                if unsupported:
+                    raise ValueError(
+                        f"Year {year} is not available for: {', '.join(sorted(unsupported))}"
+                    )
+            return requested
+
+        year_sets = [
+            set(encoder.get_available_years() or []) for encoder in temporal_encoders.values()
+        ]
+        common_years = sorted(set.intersection(*year_sets))
+        if not common_years:
+            raise RuntimeError(
+                "Selected temporal encoders do not share any common years. "
+                "Pass --years explicitly to constrain the run."
+            )
+        return common_years
+
+    def download_land_mask(self) -> Path:
+        """Download Natural Earth land shapefile for masking."""
         land_file = self.cache_dir / "ne_110m_land.shp"
 
         if land_file.exists():
@@ -123,39 +157,38 @@ class GeospatialDatasetGenerator:
         zip_path = self.cache_dir / "ne_110m_land.zip"
 
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
         }
 
         try:
             response = requests.get(url, headers=headers, timeout=30, stream=True)
             response.raise_for_status()
 
-            total_size = int(response.headers.get('content-length', 0))
-            with open(zip_path, 'wb') as f:
+            total_size = int(response.headers.get("content-length", 0))
+            with open(zip_path, "wb") as file_handle:
                 downloaded = 0
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
-                        f.write(chunk)
+                        file_handle.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            print(f"\rDownloading: {percent:.1f}%", end='', flush=True)
+                            print(f"\rDownloading: {percent:.1f}%", end="", flush=True)
             print()
 
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(self.cache_dir)
             print("Successfully downloaded and extracted Natural Earth data")
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to download Natural Earth data: {e}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to download Natural Earth data: {exc}") from exc
         finally:
             if zip_path.exists():
                 zip_path.unlink()
 
         return land_file
 
-    def load_land_mask(self):
-        """Load land shapefile as mask"""
+    def load_land_mask(self) -> None:
+        """Load land shapefile as mask."""
         if self.land_mask is not None:
             return
 
@@ -164,342 +197,530 @@ class GeospatialDatasetGenerator:
         self.land_mask = gpd.read_file(land_file)
         print(f"Land mask loaded with {len(self.land_mask)} land polygons")
 
-    def fibonacci_sphere_sampling(self, n_points):
-        """Fibonacci sphere sampling for uniform distribution"""
+    def fibonacci_sphere_sampling(self, n_points: int) -> tuple[np.ndarray, np.ndarray]:
+        """Fibonacci sphere sampling for nearly uniform distribution."""
         print(f"Generating {n_points:,} Fibonacci sphere points...")
-
-        indices = np.arange(0, n_points, dtype=float) + 0.5
+        index_offset = self.rng.random()
+        azimuth_offset = self.rng.uniform(0.0, 2.0 * np.pi)
+        indices = np.arange(0, n_points, dtype=float) + index_offset
         phi = np.arccos(1 - 2 * indices / n_points)
-        theta = np.pi * (1 + 5 ** 0.5) * indices
+        theta = np.pi * (1 + 5**0.5) * indices + azimuth_offset
 
         latitude_deg = 90 - np.degrees(phi)
         longitude_deg = np.degrees(theta) % 360 - 180
-
         return longitude_deg, latitude_deg
 
-    def vectorized_land_filter(self, longitude, latitude, batch_size=10000):
-        """Fast vectorized land filtering"""
+    def vectorized_land_filter(
+        self, longitude: np.ndarray, latitude: np.ndarray, batch_size: int = 10000
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized land filtering against Natural Earth polygons."""
         self.load_land_mask()
 
         print("Filtering for land points (vectorized)...")
         land_union = self.land_mask.geometry.unary_union
         land_mask = np.zeros(len(longitude), dtype=bool)
 
-        for i in tqdm(range(0, len(longitude), batch_size), desc="Land filtering"):
-            end_idx = min(i + batch_size, len(longitude))
-            batch_lon = longitude[i:end_idx]
-            batch_lat = latitude[i:end_idx]
-            batch_mask = contains(land_union, batch_lon, batch_lat)
-            land_mask[i:end_idx] = batch_mask
+        for start_idx in tqdm(range(0, len(longitude), batch_size), desc="Land filtering"):
+            end_idx = min(start_idx + batch_size, len(longitude))
+            batch_mask = contains(
+                land_union,
+                longitude[start_idx:end_idx],
+                latitude[start_idx:end_idx],
+            )
+            land_mask[start_idx:end_idx] = batch_mask
 
         land_longitude = longitude[land_mask]
         land_latitude = latitude[land_mask]
-
-        print(f"Found {len(land_longitude):,} land points out of {len(longitude):,} total")
+        print(
+            f"Found {len(land_longitude):,} land points out of {len(longitude):,} total"
+        )
         return land_longitude, land_latitude
 
-    def get_embeddings(self, latitude, longitude):
-        """
-        Get embeddings from all initialized encoders.
-
-        Args:
-            latitude: Array of latitude coordinates
-            longitude: Array of longitude coordinates
-
-        Returns:
-            Dictionary mapping encoder names to embedding arrays
-        """
+    def get_embeddings(
+        self, latitude: np.ndarray, longitude: np.ndarray, year: int | None = None
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        """Get embeddings from all initialized encoders and a combined validity mask."""
         if not self.encoders:
             raise RuntimeError("No encoders initialized. Call initialize_encoders() first.")
 
-        print(f"\nGenerating embeddings for {len(latitude):,} coordinates...")
+        print(
+            f"\nGenerating embeddings for {len(latitude):,} coordinates"
+            + (f" for year {year}" if year is not None else "")
+            + "..."
+        )
 
-        # Create coordinate tensor in standard (lat, lon) format
-        coordinates = torch.Tensor([[lat, lon] for lat, lon in zip(latitude, longitude)])
+        coordinates = torch.tensor(
+            np.column_stack([latitude, longitude]), dtype=torch.float32
+        )
 
-        all_embeddings = {}
+        all_embeddings: dict[str, np.ndarray] = {}
+        combined_valid = np.ones(len(latitude), dtype=bool)
 
         for encoder_name, encoder in self.encoders.items():
-            print(f"  Processing with {encoder_name.upper()}...")
+            print(f"  Processing with {encoder_name}...")
+            batch_size = getattr(encoder, "batch_size", 5000)
+            embeddings_list: list[np.ndarray] = []
+            validity_list: list[np.ndarray] = []
 
-            # Process in batches to avoid memory issues
-            batch_size = 5000
-            embeddings_list = []
+            for start_idx in tqdm(
+                range(0, len(coordinates), batch_size),
+                desc=f"  {encoder_name}",
+                leave=False,
+            ):
+                end_idx = min(start_idx + batch_size, len(coordinates))
+                batch_coords = coordinates[start_idx:end_idx]
+                batch_embeddings = encoder.encode(batch_coords, year=year).detach().cpu().float()
+                batch_valid = encoder.validate_embeddings(batch_embeddings).detach().cpu().numpy()
+                embeddings_list.append(batch_embeddings.numpy())
+                validity_list.append(batch_valid.astype(bool))
 
-            for i in tqdm(range(0, len(coordinates), batch_size),
-                         desc=f"  {encoder_name.upper()}",
-                         leave=False):
-                end_idx = min(i + batch_size, len(coordinates))
-                batch_coords = coordinates[i:end_idx]
-                batch_emb = encoder.encode(batch_coords)
-                embeddings_list.append(batch_emb)
-
-            # Concatenate all batches
-            embeddings = torch.cat(embeddings_list, dim=0).numpy()
+            embeddings = np.concatenate(embeddings_list, axis=0)
+            valid_mask = np.concatenate(validity_list, axis=0)
+            combined_valid &= valid_mask
             all_embeddings[encoder_name] = embeddings
 
-            # Print statistics
-            print(f"    Shape: {embeddings.shape}, "
-                  f"Mean: {np.mean(embeddings):.4f}, "
-                  f"Std: {np.std(embeddings):.4f}")
+            valid_embeddings = embeddings[valid_mask]
+            if len(valid_embeddings) > 0:
+                print(
+                    f"    Shape: {embeddings.shape}, "
+                    f"Valid: {int(valid_mask.sum()):,}/{len(valid_mask):,}, "
+                    f"Mean: {valid_embeddings.mean():.4f}, "
+                    f"Std: {valid_embeddings.std():.4f}"
+                )
+            else:
+                print(f"    Shape: {embeddings.shape}, Valid: 0/{len(valid_mask):,}")
 
-        return all_embeddings
+        return all_embeddings, combined_valid
 
-    def generate_dataset(self, n_points=100000,
-                        encoders=None,
-                        output_format="pt",
-                        output_path="geospatial_dataset",
-                        device=None,
-                        plot_results=True):
-        """
-        Generate the complete dataset.
+    def sample_valid_dataset(
+        self, n_points: int, year: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        """Sample land coordinates until enough valid embeddings are collected."""
+        oversample_factor = 3.5
+        collected_longitude: list[np.ndarray] = []
+        collected_latitude: list[np.ndarray] = []
+        collected_embeddings = {name: [] for name in self.encoders.keys()}
 
-        Args:
-            n_points: Target number of land points
-            encoders: List of encoder names to use (None = all available)
-            output_format: "pt" or "csv"
-            output_path: Output file path (without extension)
-            device: Device for models ('cuda', 'cpu', or None)
-            plot_results: Whether to create visualization plots
-        """
-        # Initialize encoders
-        self.initialize_encoders(encoders, device)
+        while sum(len(chunk) for chunk in collected_longitude) < n_points:
+            remaining = n_points - sum(len(chunk) for chunk in collected_longitude)
+            initial_points = max(int(np.ceil(remaining * oversample_factor)), remaining)
 
-        # Generate points with oversampling for land filtering
-        oversample_factor = 3.5  # ~29% of Earth is land
-        initial_points = int(n_points * oversample_factor)
+            longitude, latitude = self.fibonacci_sphere_sampling(initial_points)
+            land_longitude, land_latitude = self.vectorized_land_filter(longitude, latitude)
+            if len(land_longitude) == 0:
+                continue
 
-        longitude, latitude = self.fibonacci_sphere_sampling(initial_points)
-        land_longitude, land_latitude = self.vectorized_land_filter(longitude, latitude)
+            batch_embeddings, valid_mask = self.get_embeddings(
+                land_latitude, land_longitude, year=year
+            )
+            if not valid_mask.any():
+                print("No valid embeddings found in this batch. Resampling...")
+                continue
 
-        # If we don't have enough, generate more
-        while len(land_longitude) < n_points:
-            print(f"Need more points. Have {len(land_longitude):,}, need {n_points:,}")
-            additional_points = int((n_points - len(land_longitude)) * oversample_factor)
-            add_lon, add_lat = self.fibonacci_sphere_sampling(additional_points)
-            add_land_lon, add_land_lat = self.vectorized_land_filter(add_lon, add_lat)
-            land_longitude = np.concatenate([land_longitude, add_land_lon])
-            land_latitude = np.concatenate([land_latitude, add_land_lat])
+            valid_longitude = land_longitude[valid_mask]
+            valid_latitude = land_latitude[valid_mask]
+            take = min(len(valid_longitude), remaining)
+            if len(valid_longitude) > take:
+                chosen = self.rng.choice(len(valid_longitude), take, replace=False)
+            else:
+                chosen = np.arange(take)
 
-        # Trim to exact number requested
-        if len(land_longitude) > n_points:
-            indices = np.random.choice(len(land_longitude), int(n_points), replace=False)
-            land_longitude = land_longitude[indices]
-            land_latitude = land_latitude[indices]
+            collected_longitude.append(valid_longitude[chosen])
+            collected_latitude.append(valid_latitude[chosen])
+            for encoder_name, embeddings in batch_embeddings.items():
+                collected_embeddings[encoder_name].append(embeddings[valid_mask][chosen])
 
-        print(f"\nFinal dataset has {len(land_longitude):,} points")
+            current = sum(len(chunk) for chunk in collected_longitude)
+            print(f"Collected {current:,}/{n_points:,} valid points")
 
-        # Get embeddings from all encoders
-        embeddings_dict = self.get_embeddings(land_latitude, land_longitude)
+        longitude = np.concatenate(collected_longitude, axis=0)[:n_points]
+        latitude = np.concatenate(collected_latitude, axis=0)[:n_points]
+        embeddings = {
+            name: np.concatenate(chunks, axis=0)[:n_points]
+            for name, chunks in collected_embeddings.items()
+        }
+        return longitude, latitude, embeddings
 
-        # Save dataset
+    def build_dataset(
+        self,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        embeddings_dict: dict[str, np.ndarray],
+        year: int | None = None,
+    ) -> dict[str, object]:
+        """Build the in-memory dataset dictionary with explicit coordinate conventions."""
+        coordinates_latlon = np.column_stack([latitude, longitude]).astype(np.float32)
+        coordinates_lonlat = np.column_stack([longitude, latitude]).astype(np.float32)
+
+        dataset: dict[str, object] = {
+            "metadata": {
+                "coordinate_order": {
+                    "coordinates": "lat_lon",
+                    "coordinates_latlon": "lat_lon",
+                    "coordinates_lonlat": "lon_lat",
+                },
+                "year": year,
+                "n_points": int(len(latitude)),
+                "encoders": list(embeddings_dict.keys()),
+                "encoder_metadata": {
+                    name: encoder.get_metadata()
+                    for name, encoder in self.encoders.items()
+                },
+            },
+            "longitude": torch.from_numpy(longitude.astype(np.float32)),
+            "latitude": torch.from_numpy(latitude.astype(np.float32)),
+            "coordinates": torch.from_numpy(coordinates_latlon),
+            "coordinates_latlon": torch.from_numpy(coordinates_latlon),
+            "coordinates_lonlat": torch.from_numpy(coordinates_lonlat),
+        }
+
+        for encoder_name, embeddings in embeddings_dict.items():
+            dataset[f"{encoder_name}_embeddings"] = torch.from_numpy(
+                embeddings.astype(np.float32)
+            )
+
+        return dataset
+
+    def save_dataset(
+        self,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        embeddings_dict: dict[str, np.ndarray],
+        output_path: str,
+        output_format: str,
+        year: int | None = None,
+    ) -> str:
+        """Persist the dataset to disk."""
+        suffix = f"_{year}" if year is not None else ""
         if output_format == "pt":
-            dataset = {
-                'longitude': torch.from_numpy(land_longitude),
-                'latitude': torch.from_numpy(land_latitude),
-                'coordinates': torch.from_numpy(np.column_stack([land_latitude, land_longitude]))
-            }
-
-            # Add embeddings from each encoder
-            for encoder_name, embeddings in embeddings_dict.items():
-                dataset[f'{encoder_name}_embeddings'] = torch.from_numpy(embeddings)
-
-            output_file = f"{output_path}.pt"
+            dataset = self.build_dataset(latitude, longitude, embeddings_dict, year=year)
+            output_file = f"{output_path}{suffix}.pt"
             torch.save(dataset, output_file)
-            print(f"\n[OK] Saved PyTorch dataset to {output_file}")
+            return output_file
 
-            # Print dataset info
-            print("\nDataset Summary:")
-            print(f"  Keys: {list(dataset.keys())}")
-            print(f"  Number of points: {len(dataset['coordinates'])}")
-            print(f"  Coordinates shape: {dataset['coordinates'].shape}")
-            for encoder_name in embeddings_dict.keys():
-                emb_shape = dataset[f'{encoder_name}_embeddings'].shape
-                print(f"  {encoder_name.upper()} embeddings shape: {emb_shape}")
+        df_data: dict[str, np.ndarray] = {
+            "longitude": longitude.astype(np.float32),
+            "latitude": latitude.astype(np.float32),
+        }
+        for encoder_name, embeddings in embeddings_dict.items():
+            for dim_idx in range(embeddings.shape[1]):
+                df_data[f"{encoder_name}_emb_{dim_idx:04d}"] = embeddings[:, dim_idx]
+        if year is not None:
+            df_data["year"] = np.full(len(latitude), year, dtype=np.int32)
 
-        else:  # CSV format
-            df_data = {
-                'longitude': land_longitude,
-                'latitude': land_latitude,
-            }
-
-            # Add embedding columns from each encoder
-            for encoder_name, embeddings in embeddings_dict.items():
-                for i in range(embeddings.shape[1]):
-                    df_data[f'{encoder_name}_emb_{i:03d}'] = embeddings[:, i]
-
-            df = pd.DataFrame(df_data)
-            output_file = f"{output_path}.csv"
-            df.to_csv(output_file, index=False)
-            print(f"\n[OK] Saved CSV dataset to {output_file}")
-            print(f"\nDataset shape: {df.shape}")
-
-        # Create visualizations
-        if plot_results:
-            self.plot_sampled_locations(land_longitude, land_latitude,
-                                       f"{output_path}_locations.png")
-
-            # Create PCA visualization for each encoder
-            for encoder_name, embeddings in embeddings_dict.items():
-                self.plot_pca_embeddings(land_longitude, land_latitude, embeddings,
-                                       encoder_name,
-                                       f"{output_path}_{encoder_name}_pca.png")
-
+        output_file = f"{output_path}{suffix}.csv"
+        pd.DataFrame(df_data).to_csv(output_file, index=False)
         return output_file
 
-    def plot_sampled_locations(self, longitude, latitude, save_path):
-        """Create a plot showing the sampled land locations"""
-        print(f"\nCreating location plot for {len(longitude):,} points...")
+    def generate_dataset(
+        self,
+        n_points: int = 100000,
+        encoders: list[str] | None = None,
+        output_format: str = "pt",
+        output_path: str = "geospatial_dataset",
+        device: str | None = None,
+        plot_results: bool = True,
+        years: list[int] | None = None,
+    ) -> list[str]:
+        """Generate one or more datasets, splitting by year when requested."""
+        self.initialize_encoders(encoders, device)
+        resolved_years = self.resolve_years(years)
 
+        output_files: list[str] = []
+        for year in resolved_years:
+            print("\n" + "=" * 60)
+            if year is None:
+                print("Generating static dataset")
+            else:
+                print(f"Generating dataset for year {year}")
+            print("=" * 60)
+
+            longitude, latitude, embeddings_dict = self.sample_valid_dataset(
+                n_points=n_points, year=year
+            )
+            output_file = self.save_dataset(
+                latitude=latitude,
+                longitude=longitude,
+                embeddings_dict=embeddings_dict,
+                output_path=output_path,
+                output_format=output_format,
+                year=year,
+            )
+            output_files.append(output_file)
+            print(f"[OK] Saved dataset to {output_file}")
+
+            if plot_results:
+                self.plot_sampled_locations(
+                    longitude,
+                    latitude,
+                    f"{Path(output_file).with_suffix('')}_locations.png",
+                    year=year,
+                )
+                for encoder_name, embeddings in embeddings_dict.items():
+                    self.plot_ica_embeddings(
+                        longitude,
+                        latitude,
+                        embeddings,
+                        encoder_name,
+                        f"{Path(output_file).with_suffix('')}_{encoder_name}_ica.png",
+                        year=year,
+                    )
+
+        return output_files
+
+    def plot_sampled_locations(
+        self,
+        longitude: np.ndarray,
+        latitude: np.ndarray,
+        save_path: str,
+        year: int | None = None,
+    ) -> None:
+        """Create a plot showing the sampled land locations."""
+        print(f"\nCreating location plot for {len(longitude):,} points...")
         fig = plt.figure(figsize=(15, 8))
 
+        title_suffix = f"\nYear {year}" if year is not None else ""
         if CARTOPY_AVAILABLE:
             ax = plt.axes(projection=ccrs.Robinson())
             ax.add_feature(cfeatures.COASTLINE, linewidth=0.5)
-            ax.add_feature(cfeatures.LAND, color='lightgray', alpha=0.5)
-            ax.add_feature(cfeatures.OCEAN, color='lightblue', alpha=0.3)
+            ax.add_feature(cfeatures.LAND, color="lightgray", alpha=0.5)
+            ax.add_feature(cfeatures.OCEAN, color="lightblue", alpha=0.3)
             ax.add_feature(cfeatures.BORDERS, linewidth=0.3, alpha=0.7)
 
-            ax.scatter(longitude, latitude, c='red', s=0.5, alpha=0.6,
-                      transform=ccrs.PlateCarree(),
-                      label=f'{len(longitude):,} sampled points')
-
-            ax.set_title(f'Geospatial Dataset: {len(longitude):,} Land Points\n'
-                        f'(Fibonacci Sphere Sampling)', fontsize=14, pad=20)
-            ax.legend(loc='lower left')
+            ax.scatter(
+                longitude,
+                latitude,
+                c="red",
+                s=0.5,
+                alpha=0.6,
+                transform=ccrs.PlateCarree(),
+                label=f"{len(longitude):,} sampled points",
+            )
+            ax.set_title(
+                f"Geospatial Dataset: {len(longitude):,} Land Points{title_suffix}",
+                fontsize=14,
+                pad=20,
+            )
+            ax.legend(loc="lower left")
             ax.gridlines(draw_labels=False, alpha=0.3)
         else:
             ax = plt.subplot(111)
-            ax.scatter(longitude, latitude, c='red', s=0.5, alpha=0.6)
-            ax.set_xlabel('Longitude')
-            ax.set_ylabel('Latitude')
-            ax.set_title(f'Geospatial Dataset: {len(longitude):,} Land Points')
+            ax.scatter(longitude, latitude, c="red", s=0.5, alpha=0.6)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title(f"Geospatial Dataset: {len(longitude):,} Land Points{title_suffix}")
             ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
         print(f"[OK] Location plot saved to {save_path}")
-        plt.close()
 
-        # Create density heatmap
-        fig2, ax2 = plt.subplots(1, 1, figsize=(12, 6))
-        hist, xedges, yedges = np.histogram2d(longitude, latitude, bins=180)
-        extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
-        im = ax2.imshow(hist.T, extent=extent, origin='lower',
-                       cmap='Reds', aspect='auto', interpolation='gaussian')
-        ax2.set_xlabel('Longitude')
-        ax2.set_ylabel('Latitude')
-        ax2.set_title(f'Sampling Density Heatmap ({len(longitude):,} points)')
-        plt.colorbar(im, ax=ax2, label='Point Density')
+    def project_embeddings_to_rgb(self, embeddings: np.ndarray) -> np.ndarray:
+        """Project embeddings to RGB using ICA, with a robust fallback."""
+        if embeddings.shape[0] < 3:
+            base = np.zeros((embeddings.shape[0], 3), dtype=np.float32)
+            base[:, : min(3, embeddings.shape[1])] = embeddings[:, : min(3, embeddings.shape[1])]
+            return base
 
-        density_path = save_path.replace('.png', '_density.png')
-        plt.tight_layout()
-        plt.savefig(density_path, dpi=300, bbox_inches='tight')
-        print(f"[OK] Density plot saved to {density_path}")
-        plt.close()
+        fit_sample_size = min(len(embeddings), 100000)
+        if len(embeddings) > fit_sample_size:
+            sample_idx = np.random.default_rng(42).choice(
+                len(embeddings), size=fit_sample_size, replace=False
+            )
+            fit_embeddings = embeddings[sample_idx]
+        else:
+            fit_embeddings = embeddings
 
-    def plot_pca_embeddings(self, longitude, latitude, embeddings, encoder_name, save_path):
-        """Create a world map with points colored by PCA-projected embeddings"""
-        print(f"\nCreating PCA visualization for {encoder_name.upper()}...")
-
-        # Perform PCA
         scaler = StandardScaler()
-        embeddings_scaled = scaler.fit_transform(embeddings)
-        pca = PCA(n_components=3)
-        pca_embeddings = pca.fit_transform(embeddings_scaled)
+        fit_scaled = scaler.fit_transform(fit_embeddings)
 
-        print(f"  PCA explained variance: {pca.explained_variance_ratio_}")
-        print(f"  Total: {pca.explained_variance_ratio_.sum():.3f}")
+        try:
+            ica = FastICA(
+                n_components=3,
+                whiten="unit-variance",
+                random_state=42,
+                max_iter=1000,
+            )
+            ica.fit(fit_scaled)
 
-        # Normalize to RGB
-        pca_normalized = np.zeros_like(pca_embeddings)
-        for i in range(3):
-            comp = pca_embeddings[:, i]
-            pca_normalized[:, i] = (comp - comp.min()) / (comp.max() - comp.min())
-        colors = pca_normalized
+            projected_chunks: list[np.ndarray] = []
+            batch_size = 100000
+            for start_idx in range(0, len(embeddings), batch_size):
+                end_idx = min(start_idx + batch_size, len(embeddings))
+                batch_scaled = scaler.transform(embeddings[start_idx:end_idx])
+                projected_chunks.append(ica.transform(batch_scaled))
+            projected = np.concatenate(projected_chunks, axis=0)
+        except Exception:
+            fallback_scaled = scaler.fit_transform(embeddings)
+            projected = fallback_scaled[:, :3] if fallback_scaled.shape[1] >= 3 else np.pad(
+                fallback_scaled,
+                ((0, 0), (0, 3 - fallback_scaled.shape[1])),
+                mode="constant",
+            )
 
-        # Create main plot
+        projected = np.nan_to_num(projected, nan=0.0, posinf=0.0, neginf=0.0)
+        colors = np.zeros_like(projected, dtype=np.float32)
+        for component_idx in range(3):
+            component = projected[:, component_idx]
+            comp_min = component.min()
+            comp_max = component.max()
+            if np.isclose(comp_min, comp_max):
+                colors[:, component_idx] = 0.5
+            else:
+                colors[:, component_idx] = (component - comp_min) / (comp_max - comp_min)
+        return colors
+
+    def plot_ica_embeddings(
+        self,
+        longitude: np.ndarray,
+        latitude: np.ndarray,
+        embeddings: np.ndarray,
+        encoder_name: str,
+        save_path: str,
+        year: int | None = None,
+    ) -> None:
+        """Create a world map with points colored by ICA-projected embeddings."""
+        print(f"\nCreating ICA visualization for {encoder_name}...")
+        colors = self.project_embeddings_to_rgb(embeddings)
+
         fig = plt.figure(figsize=(20, 12))
+        title_suffix = f" - Year {year}" if year is not None else ""
 
         if CARTOPY_AVAILABLE:
             ax = plt.axes(projection=ccrs.Robinson())
             ax.add_feature(cfeatures.COASTLINE, linewidth=0.5)
-            ax.add_feature(cfeatures.LAND, color='lightgray', alpha=0.3)
-            ax.add_feature(cfeatures.OCEAN, color='lightblue', alpha=0.2)
+            ax.add_feature(cfeatures.LAND, color="lightgray", alpha=0.3)
+            ax.add_feature(cfeatures.OCEAN, color="lightblue", alpha=0.2)
             ax.add_feature(cfeatures.BORDERS, linewidth=0.3, alpha=0.5)
-
-            ax.scatter(longitude, latitude, c=colors, s=1.0, alpha=0.8,
-                      transform=ccrs.PlateCarree())
-
-            ax.set_title(f'{encoder_name.upper()} Embeddings (PCA-projected to RGB)\n'
-                        f'{len(longitude):,} points - '
-                        f'Explained variance: {pca.explained_variance_ratio_.sum():.1%}',
-                        fontsize=16, pad=20)
+            ax.scatter(
+                longitude,
+                latitude,
+                c=colors,
+                s=1.0,
+                alpha=0.8,
+                transform=ccrs.PlateCarree(),
+            )
+            ax.set_title(
+                f"{encoder_name} Embeddings (ICA-projected to RGB){title_suffix}\n"
+                f"{len(longitude):,} points",
+                fontsize=16,
+                pad=20,
+            )
             ax.gridlines(draw_labels=False, alpha=0.3)
         else:
             ax = plt.subplot(111)
             ax.scatter(longitude, latitude, c=colors, s=1.0, alpha=0.8)
-            ax.set_xlabel('Longitude')
-            ax.set_ylabel('Latitude')
-            ax.set_title(f'{encoder_name.upper()} Embeddings (PCA-projected to RGB)\n'
-                        f'{len(longitude):,} points - '
-                        f'Explained variance: {pca.explained_variance_ratio_.sum():.1%}')
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title(
+                f"{encoder_name} Embeddings (ICA-projected to RGB){title_suffix}\n"
+                f"{len(longitude):,} points"
+            )
             ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"[OK] PCA plot saved to {save_path}")
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
+        print(f"[OK] ICA plot saved to {save_path}")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate geospatial embedding datasets",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Generate land-only geospatial embedding datasets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument('--n_points', type=int, default=100000,
-                       help='Number of land points to generate (default: 100000)')
-    parser.add_argument('--encoders', nargs='+', choices=['geoclip', 'satclip'],
-                       help='Encoders to use (default: all available)')
-    parser.add_argument('--output_format', choices=['pt', 'csv'], default='pt',
-                       help='Output format (default: pt)')
-    parser.add_argument('--output_path', type=str, default='geospatial_dataset',
-                       help='Output file path without extension (default: geospatial_dataset)')
-    parser.add_argument('--device', choices=['cuda', 'cpu'],
-                       help='Device to run models on (default: auto-detect)')
-    parser.add_argument('--no_plot', action='store_true',
-                       help='Skip generating plots')
-    parser.add_argument('--cache_dir', type=str, default='./data_cache',
-                       help='Directory for caching land mask data (default: ./data_cache)')
+    parser.add_argument(
+        "--n_points",
+        type=int,
+        default=100000,
+        help="Number of valid land points to generate per output file",
+    )
+    parser.add_argument(
+        "--encoders",
+        nargs="+",
+        default=list(DEFAULT_ENCODERS),
+        help=(
+            "Encoders to use. Canonical names: "
+            + ", ".join(list_encoder_names())
+            + ". Aliases such as clay, copernicus, and gse are also accepted."
+        ),
+    )
+    parser.add_argument(
+        "--years",
+        nargs="+",
+        type=int,
+        help="Optional explicit years to generate. Temporal encoders will use these years.",
+    )
+    parser.add_argument(
+        "--encoder_root",
+        action="append",
+        help="Repeatable mapping of encoder=PATH for TorchGeo-backed products.",
+    )
+    parser.add_argument(
+        "--output_format",
+        choices=["pt", "csv"],
+        default="pt",
+        help="Output format (default: pt)",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="geospatial_dataset",
+        help="Output file path prefix without extension",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "cpu"],
+        help="Device to run model-backed encoders on (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--no_plot",
+        action="store_true",
+        help="Skip generating plots",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default="./data_cache",
+        help="Directory for caching land mask data",
+    )
 
     args = parser.parse_args()
+    encoder_roots = parse_encoder_roots(args.encoder_root)
 
-    print("="*60)
+    print("=" * 60)
     print("Geospatial Embedding Dataset Generator")
-    print("="*60)
-    print(f"Target points: {args.n_points:,}")
-    print(f"Encoders: {args.encoders or 'all available'}")
+    print("=" * 60)
+    print(f"Target points per file: {args.n_points:,}")
+    print(f"Encoders: {args.encoders}")
+    print(f"Years: {args.years or 'auto/static'}")
     print(f"Output format: {args.output_format}")
     print(f"Device: {args.device or 'auto-detect'}")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
-    generator = GeospatialDatasetGenerator(cache_dir=args.cache_dir)
-
-    output_file = generator.generate_dataset(
+    generator = GeospatialDatasetGenerator(
+        cache_dir=args.cache_dir,
+        encoder_roots=encoder_roots,
+    )
+    output_files = generator.generate_dataset(
         n_points=args.n_points,
         encoders=args.encoders,
         output_format=args.output_format,
         output_path=args.output_path,
         device=args.device,
-        plot_results=not args.no_plot
+        plot_results=not args.no_plot,
+        years=args.years,
     )
 
-    print("\n" + "="*60)
-    print(f"[OK] Dataset generation complete!")
-    print(f"Output: {output_file}")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("[OK] Dataset generation complete!")
+    for output_file in output_files:
+        print(f"Output: {output_file}")
+    print("=" * 60)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

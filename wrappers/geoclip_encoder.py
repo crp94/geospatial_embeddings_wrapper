@@ -23,7 +23,7 @@ class GeoCLIPEncoder(GeoEmbeddingEncoder):
     Uses Equal Earth projection and Gaussian Random Fourier Features.
     """
 
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, data_root: str | None = None):
         """
         Initialize GeoCLIP encoder.
 
@@ -43,7 +43,9 @@ class GeoCLIPEncoder(GeoEmbeddingEncoder):
         self.encoder.to(self.device)
         self.encoder.eval()
 
-    def encode(self, coordinates: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, coordinates: torch.Tensor, year: int | None = None
+    ) -> torch.Tensor:
         """
         Encode geographic coordinates to embeddings using GeoCLIP.
 

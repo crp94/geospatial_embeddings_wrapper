@@ -6,9 +6,8 @@ from geographic coordinates using different models.
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional
+from typing import Any, Optional
 import torch
-import numpy as np
 
 
 class GeoEmbeddingEncoder(ABC):
@@ -32,12 +31,15 @@ class GeoEmbeddingEncoder(ABC):
             self.device = device
 
     @abstractmethod
-    def encode(self, coordinates: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, coordinates: torch.Tensor, year: Optional[int] = None
+    ) -> torch.Tensor:
         """
         Encode geographic coordinates to embeddings.
 
         Args:
             coordinates: Tensor of shape (N, 2) where each row is [latitude, longitude]
+            year: Optional calendar year for temporal embedding products
 
         Returns:
             Tensor of shape (N, embedding_dim) containing the embeddings
@@ -53,6 +55,36 @@ class GeoEmbeddingEncoder(ABC):
             Integer representing the embedding dimension
         """
         pass
+
+    def is_temporal(self) -> bool:
+        """Whether the encoder exposes year-specific embeddings."""
+        return False
+
+    def get_available_years(self) -> list[int] | None:
+        """Return available years for temporal encoders."""
+        return None
+
+    def validate_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Return a boolean mask indicating which embedding rows are valid.
+
+        By default, any row containing NaN/Inf values is considered invalid.
+        """
+        if embeddings.ndim != 2:
+            raise ValueError(
+                f"Expected embeddings with shape (N, D), received {tuple(embeddings.shape)}"
+            )
+        return torch.isfinite(embeddings).all(dim=1)
+
+    def get_metadata(self) -> dict[str, Any]:
+        """Return serializable metadata describing this encoder."""
+        return {
+            "name": self.name,
+            "embedding_dim": self.get_embedding_dim(),
+            "input_coordinate_order": self.coordinate_order,
+            "is_temporal": self.is_temporal(),
+            "available_years": self.get_available_years(),
+        }
 
     def encode_from_list(self, coordinates: list) -> torch.Tensor:
         """
@@ -80,6 +112,11 @@ class GeoEmbeddingEncoder(ABC):
         """
         coords = torch.Tensor([[latitude, longitude]])
         return self.encode(coords)
+
+    @property
+    def coordinate_order(self) -> str:
+        """Get the expected coordinate order for encode inputs."""
+        return "lat_lon"
 
     @property
     def name(self) -> str:

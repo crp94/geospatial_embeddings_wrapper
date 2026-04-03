@@ -42,7 +42,8 @@ class SatCLIPEncoder(GeoEmbeddingEncoder):
         model_name: str = "microsoft/SatCLIP-ViT16-L40",
         checkpoint_name: str = "satclip-vit16-l40.ckpt",
         device: str = None,
-        checkpoint_path: str = None
+        checkpoint_path: str = None,
+        data_root: str | None = None,
     ):
         """
         Initialize SatCLIP encoder.
@@ -77,7 +78,9 @@ class SatCLIPEncoder(GeoEmbeddingEncoder):
         self.model = get_satclip(checkpoint_path, device=self.device)
         self.model.eval()
 
-    def encode(self, coordinates: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, coordinates: torch.Tensor, year: int | None = None
+    ) -> torch.Tensor:
         """
         Encode geographic coordinates to embeddings using SatCLIP.
 
