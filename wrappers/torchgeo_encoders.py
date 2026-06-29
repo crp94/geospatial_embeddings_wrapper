@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 from pathlib import Path
+import logging
+import time
 
 import geopandas as gpd
 import numpy as np
@@ -28,6 +30,8 @@ from torchgeo.datasets import (
 
 from .embedding_encoder import GeoEmbeddingEncoder
 
+LOGGER = logging.getLogger(__name__)
+
 
 def _year_overlap_mask(index: pd.IntervalIndex, year: int) -> np.ndarray:
     """Return a boolean mask for rows whose interval overlaps the requested year."""
@@ -37,12 +41,25 @@ def _year_overlap_mask(index: pd.IntervalIndex, year: int) -> np.ndarray:
     return index.overlaps(year_interval)
 
 
+def _sample_latitudes_on_sphere(
+    south: np.ndarray,
+    north: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample latitudes uniformly on the sphere between south/north bounds."""
+    south_sin = np.sin(np.deg2rad(south))
+    north_sin = np.sin(np.deg2rad(north))
+    return np.rad2deg(np.arcsin(rng.uniform(south_sin, north_sin)))
+
+
 def _sample_from_wgs84_file_index(
     coordinates: torch.Tensor,
     index_df: gpd.GeoDataFrame,
     embedding_dim: int,
     filepath_column: str = "filepath",
     rasterio_env_options: dict[str, str] | None = None,
+    max_file_retries: int = 1,
+    retry_wait_seconds: float = 0.0,
 ) -> torch.Tensor:
     """
     Sample raster embeddings using a WGS84 polygon index and per-file reprojection.
@@ -85,11 +102,34 @@ def _sample_from_wgs84_file_index(
         sample_lat = group["latitude"].to_numpy(dtype=np.float64)
 
         env_options = rasterio_env_options or {}
-        with rasterio.Env(**env_options):
-            with rasterio.open(filepath) as src:
-                transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-                sample_x, sample_y = transformer.transform(sample_lon, sample_lat)
-                samples = np.asarray(list(src.sample(list(zip(sample_x, sample_y)))))
+        samples = None
+        last_error: Exception | None = None
+        for attempt in range(1, max_file_retries + 1):
+            try:
+                with rasterio.Env(**env_options):
+                    with rasterio.open(filepath) as src:
+                        transformer = Transformer.from_crs(
+                            "EPSG:4326", src.crs, always_xy=True
+                        )
+                        sample_x, sample_y = transformer.transform(sample_lon, sample_lat)
+                        samples = np.asarray(list(src.sample(list(zip(sample_x, sample_y)))))
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == max_file_retries:
+                    LOGGER.warning(
+                        "Failed to sample remote raster after %s attempts: %s (%s points)",
+                        attempt,
+                        filepath,
+                        len(row_indices),
+                    )
+                elif retry_wait_seconds > 0:
+                    time.sleep(retry_wait_seconds)
+
+        if samples is None:
+            if last_error is not None:
+                LOGGER.warning("Last sampling error for %s: %s", filepath, last_error)
+            continue
 
         if samples.ndim == 1:
             samples = samples[:, None]
@@ -275,7 +315,7 @@ class TesseraEmbeddingsEncoder(TorchGeoRasterPointEncoder):
     dataset_cls = TesseraEmbeddings
     encoder_id = "tessera"
     temporal = True
-    batch_size = 2000
+    batch_size = 250000
 
     def __init__(
         self,
@@ -300,6 +340,7 @@ class TesseraEmbeddingsEncoder(TorchGeoRasterPointEncoder):
         self._embeddings_dir = self._cache_root / "tiles"
         self._registry_cache_dir.mkdir(parents=True, exist_ok=True)
         self._embeddings_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_partial_tile_cache()
 
         self._geotessera = GeoTessera(
             cache_dir=self._registry_cache_dir,
@@ -308,6 +349,40 @@ class TesseraEmbeddingsEncoder(TorchGeoRasterPointEncoder):
         self._available_years = list(
             map(int, self._geotessera.registry.get_available_years())
         )
+        self._tile_centers_by_year: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _cleanup_partial_tile_cache(self) -> None:
+        representation_root = self._embeddings_dir / "global_0.1_degree_representation"
+        landmask_root = self._embeddings_dir / "global_0.1_degree_tiff_all"
+        if not representation_root.exists():
+            return
+
+        for npy_path in representation_root.rglob("*.npy"):
+            if npy_path.name.startswith("."):
+                npy_path.unlink(missing_ok=True)
+                continue
+
+            if npy_path.name.endswith("_scales.npy"):
+                embedding_path = npy_path.with_name(npy_path.name.replace("_scales.npy", ".npy"))
+                if not embedding_path.exists():
+                    npy_path.unlink(missing_ok=True)
+                continue
+
+            scales_path = npy_path.with_name(f"{npy_path.stem}_scales.npy")
+            landmask_path = landmask_root / f"{npy_path.stem}.tiff"
+            if not scales_path.exists() or not landmask_path.exists():
+                npy_path.unlink(missing_ok=True)
+                scales_path.unlink(missing_ok=True)
+
+    def _get_tile_centers(self, year: int) -> tuple[np.ndarray, np.ndarray]:
+        if year in self._tile_centers_by_year:
+            return self._tile_centers_by_year[year]
+        registry_gdf = self._geotessera.registry._registry_gdf
+        year_index = registry_gdf.loc[year].index
+        lon = year_index.get_level_values("lon_i").to_numpy(dtype=np.float64) / 100.0
+        lat = year_index.get_level_values("lat_i").to_numpy(dtype=np.float64) / 100.0
+        self._tile_centers_by_year[year] = (lon, lat)
+        return self._tile_centers_by_year[year]
 
     def encode(
         self, coordinates: torch.Tensor, year: int | None = None
@@ -342,6 +417,31 @@ class TesseraEmbeddingsEncoder(TorchGeoRasterPointEncoder):
             return super().get_available_years()
         return self._available_years
 
+    def supports_coverage_sampling(self) -> bool:
+        return self._mode == "remote"
+
+    def get_sampling_oversample_factor(self) -> float:
+        return 1.05 if self._mode == "remote" else super().get_sampling_oversample_factor()
+
+    def sample_candidate_coordinates(
+        self,
+        n_points: int,
+        year: int | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._mode != "remote":
+            return super().sample_candidate_coordinates(n_points, year=year, rng=rng)
+        if year is None:
+            raise ValueError(f"{self.name} requires an explicit year")
+        rng = rng or np.random.default_rng()
+        lon_centers, lat_centers = self._get_tile_centers(year)
+        weights = np.clip(np.cos(np.deg2rad(lat_centers)), a_min=1e-6, a_max=None)
+        weights = weights / weights.sum()
+        chosen = rng.choice(len(lon_centers), size=n_points, replace=True, p=weights)
+        longitude = lon_centers[chosen] + rng.uniform(-0.05, 0.05, size=n_points)
+        latitude = lat_centers[chosen] + rng.uniform(-0.05, 0.05, size=n_points)
+        return longitude.astype(np.float64), latitude.astype(np.float64)
+
     def get_metadata(self) -> dict[str, Any]:
         metadata = (
             super().get_metadata()
@@ -368,13 +468,15 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
     dataset_cls = GoogleSatelliteEmbedding
     encoder_id = "google_satellite_embedding"
     temporal = True
-    batch_size = 5000
+    batch_size = 250000
     index_url = "https://data.source.coop/tge-labs/aef/v1/annual/aef_index.parquet"
     remote_rasterio_env = {
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
         "CPL_VSIL_CURL_USE_HEAD": "NO",
         "GDAL_HTTP_MULTIRANGE": "YES",
+        "GDAL_HTTP_MAX_RETRY": "4",
+        "GDAL_HTTP_RETRY_DELAY": "2",
     }
 
     def __init__(
@@ -397,6 +499,7 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
         self._ensure_remote_index()
         self._year_indexes = self._load_remote_index(self._index_path)
         self._available_years = sorted(self._year_indexes.keys())
+        self._sampling_bounds_by_year = self._build_sampling_bounds()
 
     def _ensure_remote_index(self) -> None:
         if self._index_path.exists():
@@ -443,6 +546,20 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
             for year, subset in gdf.groupby("year", sort=True)
         }
 
+    def _build_sampling_bounds(self) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        sampling: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        for year, year_index in self._year_indexes.items():
+            bounds = np.asarray([geom.bounds for geom in year_index.geometry], dtype=np.float64)
+            west = bounds[:, 0]
+            south = bounds[:, 1]
+            east = bounds[:, 2]
+            north = bounds[:, 3]
+            mid_lat = 0.5 * (south + north)
+            weights = np.clip((east - west) * (north - south) * np.cos(np.deg2rad(mid_lat)), a_min=1e-6, a_max=None)
+            weights = weights / weights.sum()
+            sampling[year] = (west, south, east, north, weights)
+        return sampling
+
     def encode(
         self, coordinates: torch.Tensor, year: int | None = None
     ) -> torch.Tensor:
@@ -461,6 +578,8 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
             self._year_indexes[year],
             embedding_dim=self._embedding_dim,
             rasterio_env_options=self.remote_rasterio_env,
+            max_file_retries=4,
+            retry_wait_seconds=2.0,
         )
 
     def get_embedding_dim(self) -> int:
@@ -472,6 +591,29 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
         if self._mode == "local":
             return super().get_available_years()
         return self._available_years
+
+    def supports_coverage_sampling(self) -> bool:
+        return self._mode == "remote"
+
+    def get_sampling_oversample_factor(self) -> float:
+        return 1.1 if self._mode == "remote" else super().get_sampling_oversample_factor()
+
+    def sample_candidate_coordinates(
+        self,
+        n_points: int,
+        year: int | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._mode != "remote":
+            return super().sample_candidate_coordinates(n_points, year=year, rng=rng)
+        if year is None:
+            raise ValueError(f"{self.name} requires an explicit year")
+        rng = rng or np.random.default_rng()
+        west, south, east, north, weights = self._sampling_bounds_by_year[year]
+        chosen = rng.choice(len(weights), size=n_points, replace=True, p=weights)
+        longitude = rng.uniform(west[chosen], east[chosen])
+        latitude = _sample_latitudes_on_sphere(south[chosen], north[chosen], rng)
+        return longitude.astype(np.float64), latitude.astype(np.float64)
 
     def get_metadata(self) -> dict[str, Any]:
         metadata = (

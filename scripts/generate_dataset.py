@@ -42,6 +42,7 @@ from wrappers.registry import get_encoder_class, list_encoder_names, normalize_e
 warnings.filterwarnings("ignore")
 
 DEFAULT_ENCODERS = ["geoclip", "satclip"]
+ANTARCTICA_LATITUDE_CUTOFF = -60.0
 
 
 def parse_encoder_roots(values: list[str] | None) -> dict[str, str]:
@@ -217,24 +218,41 @@ class GeospatialDatasetGenerator:
         self.load_land_mask()
 
         print("Filtering for land points (vectorized)...")
-        land_union = self.land_mask.geometry.unary_union
-        land_mask = np.zeros(len(longitude), dtype=bool)
+        non_antarctic_mask = latitude > ANTARCTICA_LATITUDE_CUTOFF
+        if not non_antarctic_mask.any():
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
-        for start_idx in tqdm(range(0, len(longitude), batch_size), desc="Land filtering"):
-            end_idx = min(start_idx + batch_size, len(longitude))
+        candidate_longitude = longitude[non_antarctic_mask]
+        candidate_latitude = latitude[non_antarctic_mask]
+        land_union = self.land_mask.geometry.unary_union
+        land_mask = np.zeros(len(candidate_longitude), dtype=bool)
+
+        for start_idx in tqdm(
+            range(0, len(candidate_longitude), batch_size), desc="Land filtering"
+        ):
+            end_idx = min(start_idx + batch_size, len(candidate_longitude))
             batch_mask = contains(
                 land_union,
-                longitude[start_idx:end_idx],
-                latitude[start_idx:end_idx],
+                candidate_longitude[start_idx:end_idx],
+                candidate_latitude[start_idx:end_idx],
             )
             land_mask[start_idx:end_idx] = batch_mask
 
-        land_longitude = longitude[land_mask]
-        land_latitude = latitude[land_mask]
+        land_longitude = candidate_longitude[land_mask]
+        land_latitude = candidate_latitude[land_mask]
         print(
             f"Found {len(land_longitude):,} land points out of {len(longitude):,} total"
         )
         return land_longitude, land_latitude
+
+    def _get_direct_sampling_encoder(self) -> object | None:
+        """Return a single encoder that can sample from its own coverage, if available."""
+        if len(self.encoders) != 1:
+            return None
+        encoder = next(iter(self.encoders.values()))
+        if getattr(encoder, "supports_coverage_sampling", lambda: False)():
+            return encoder
+        return None
 
     def get_embeddings(
         self, latitude: np.ndarray, longitude: np.ndarray, year: int | None = None
@@ -296,7 +314,12 @@ class GeospatialDatasetGenerator:
         self, n_points: int, year: int | None = None
     ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         """Sample land coordinates until enough valid embeddings are collected."""
-        oversample_factor = 3.5
+        direct_sampling_encoder = self._get_direct_sampling_encoder()
+        oversample_factor = (
+            direct_sampling_encoder.get_sampling_oversample_factor()
+            if direct_sampling_encoder is not None
+            else 3.5
+        )
         collected_longitude: list[np.ndarray] = []
         collected_latitude: list[np.ndarray] = []
         collected_embeddings = {name: [] for name in self.encoders.keys()}
@@ -305,7 +328,14 @@ class GeospatialDatasetGenerator:
             remaining = n_points - sum(len(chunk) for chunk in collected_longitude)
             initial_points = max(int(np.ceil(remaining * oversample_factor)), remaining)
 
-            longitude, latitude = self.fibonacci_sphere_sampling(initial_points)
+            if direct_sampling_encoder is not None:
+                longitude, latitude = direct_sampling_encoder.sample_candidate_coordinates(
+                    initial_points,
+                    year=year,
+                    rng=self.rng,
+                )
+            else:
+                longitude, latitude = self.fibonacci_sphere_sampling(initial_points)
             land_longitude, land_latitude = self.vectorized_land_filter(longitude, latitude)
             if len(land_longitude) == 0:
                 continue
@@ -553,9 +583,12 @@ class GeospatialDatasetGenerator:
             projected = np.concatenate(projected_chunks, axis=0)
         except Exception:
             fallback_scaled = scaler.fit_transform(embeddings)
-            projected = fallback_scaled[:, :3] if fallback_scaled.shape[1] >= 3 else np.pad(
-                fallback_scaled,
-                ((0, 0), (0, 3 - fallback_scaled.shape[1])),
+            projected = fallback_scaled[:, :3]
+
+        if projected.shape[1] < 3:
+            projected = np.pad(
+                projected,
+                ((0, 0), (0, 3 - projected.shape[1])),
                 mode="constant",
             )
 

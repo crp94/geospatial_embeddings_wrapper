@@ -7,6 +7,8 @@ from geographic coordinates using different models.
 
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+import numpy as np
 import torch
 
 
@@ -75,6 +77,30 @@ class GeoEmbeddingEncoder(ABC):
                 f"Expected embeddings with shape (N, D), received {tuple(embeddings.shape)}"
             )
         return torch.isfinite(embeddings).all(dim=1)
+
+    def supports_coverage_sampling(self) -> bool:
+        """Whether the encoder can sample candidate coordinates from its own coverage."""
+        return False
+
+    def get_sampling_oversample_factor(self) -> float:
+        """Return a recommended oversample factor for candidate coordinate generation."""
+        return 3.5
+
+    def sample_candidate_coordinates(
+        self,
+        n_points: int,
+        year: int | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Sample candidate coordinates as `(longitude, latitude)`.
+
+        Encoders with explicit coverage metadata can override this to avoid expensive
+        rejection sampling from the global land mask.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement coverage-aware coordinate sampling"
+        )
 
     def get_metadata(self) -> dict[str, Any]:
         """Return serializable metadata describing this encoder."""

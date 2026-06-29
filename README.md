@@ -11,7 +11,7 @@ Unified tooling for generating geospatial embeddings from coordinates and for bu
 This repository has two main entry points:
 
 - `scripts/get_embeddings.py`: small point-query CLI for `geoclip` and `satclip`
-- `scripts/generate_dataset.py`: land-only dataset generator with support for 5 embedding products
+- `scripts/generate_dataset.py`: land-only dataset generator with support for coordinate models, raster products, and deterministic baselines
 
 The dataset generator currently supports:
 
@@ -20,6 +20,20 @@ The dataset generator currently supports:
 - `copernicus_embed`
 - `tessera`
 - `google_satellite_embedding`
+- `range`
+- `range_plus`
+- `csp`
+- `csp_fmow`
+- `csp_fmow_unsuper`
+- `csp_inat`
+- `csp_inat_unsuper`
+- `gtloc`
+- `torchspatial_direct`
+- `torchspatial_cartesian3d`
+- `torchspatial_wrap`
+- `torchspatial_grid`
+- `torchspatial_theory`
+- `torchspatial_rff`
 
 All dataset outputs use the same coordinate conventions and save format, even though the underlying models and products use different native coordinate orders and storage layouts.
 
@@ -101,6 +115,20 @@ python scripts/get_embeddings.py \
 - `copernicus_embed`
 - `tessera`
 - `google_satellite_embedding`
+- `range`
+- `range_plus`
+- `csp`
+- `csp_fmow`
+- `csp_fmow_unsuper`
+- `csp_inat`
+- `csp_inat_unsuper`
+- `gtloc`
+- `torchspatial_direct`
+- `torchspatial_cartesian3d`
+- `torchspatial_wrap`
+- `torchspatial_grid`
+- `torchspatial_theory`
+- `torchspatial_rff`
 
 Notes:
 
@@ -108,7 +136,23 @@ Notes:
 - `copernicus_embed` is TorchGeo-backed and auto-downloads its raster
 - `tessera` can run through `geotessera` without a local root
 - `google_satellite_embedding` can run against the public AEF annual index without a local root
+- `range` and `range_plus` wrap the open-weight RANGE models
+- `csp` wraps the open-weight Contrastive Spatial Pre-Training location encoder
+- `csp_fmow`, `csp_fmow_unsuper`, `csp_inat`, and `csp_inat_unsuper` select the other published CSP variants
+- `gtloc` wraps the open-weight GT-Loc GPS branch
+- `torchspatial_*` encoders are deterministic coordinate-feature baselines and do not require pretrained weights
 - land-only behavior is enforced by this generator layer, not by every source dataset
+
+### Checkpoints For New Models
+
+The new coordinate-only wrappers do not vendor pretrained weights in this repository. Users should download upstream checkpoints and point the generator at them when needed:
+
+- `range` / `range_plus`: pass a local SatCLIP checkpoint and RANGE database with `checkpoint=...;db=...` if the Hugging Face auto-download is not available or if you want a specific local copy
+- `csp*`: pass a local CSP `.pth.tar` checkpoint with `checkpoint=...` if the Dropbox auto-download is not available or if you want a specific CSP variant/checkpoint
+- `gtloc`: always requires a local GT-Loc checkpoint via `checkpoint=...`
+- `torchspatial_*`: no checkpoint is required
+
+Use `--encoder_root` for these paths. It accepts either `encoder=/plain/path` or a semicolon-separated spec such as `encoder=repo=/path/to/repo;checkpoint=/path/to/model.pt`.
 
 ## Dataset Generation Examples
 
@@ -151,6 +195,44 @@ python scripts/generate_dataset.py \
   --output_format csv \
   --no_plot \
   --output_path outputs/geoclip_csv
+```
+
+Generate the additional coordinate-only encoders:
+
+```bash
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders range_plus \
+  --encoder_root 'range_plus=checkpoint=/path/to/satclip.ckpt;db=/path/to/range_db_large.npz' \
+  --device cuda \
+  --output_path outputs/land_only_500k/range_plus_land_500k
+
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders csp \
+  --encoder_root 'csp=checkpoint=/path/to/csp_model.pth.tar' \
+  --device cuda \
+  --output_path outputs/land_only_500k/csp_land_500k
+
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders csp_inat \
+  --encoder_root 'csp_inat=checkpoint=/path/to/csp_inat_model.pth.tar' \
+  --device cuda \
+  --output_path outputs/land_only_500k/csp_inat_land_500k
+
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders gtloc \
+  --encoder_root 'gtloc=repo=/path/to/gtloc;checkpoint=/path/to/gtloc.pt' \
+  --device cuda \
+  --output_path outputs/land_only_500k/gtloc_land_500k
+
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders torchspatial_direct torchspatial_cartesian3d torchspatial_wrap \
+             torchspatial_grid torchspatial_theory torchspatial_rff \
+  --output_path outputs/land_only_500k/torchspatial_baselines_land_500k
 ```
 
 ## Output Format
@@ -233,6 +315,7 @@ The main implementation split is:
 - `wrappers/geoclip_encoder.py`
 - `wrappers/satclip_encoder.py`
 - `wrappers/torchgeo_encoders.py`
+- `wrappers/location_model_encoders.py`
 - `wrappers/registry.py`
 
 Canonical encoder names and aliases are centralized in `wrappers/registry.py`.

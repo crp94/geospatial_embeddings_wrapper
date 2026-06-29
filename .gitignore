@@ -138,11 +138,16 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv*/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Local generated data, model caches, and experiment outputs
+data_cache/
+outputs/
 
 # Spyder project settings
 .spyderproject
