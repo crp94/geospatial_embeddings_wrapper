@@ -15,6 +15,8 @@ This repository has two main entry points:
 - `scripts/get_embeddings.py`: point-query CLI for every registered encoder
 - `scripts/generate_dataset.py`: reproducible land-only dataset generator for
   coordinate models, raster products, and deterministic baselines
+- `scripts/generate_report.py`: offline visual audit and comparison reports for
+  generated embedding datasets
 
 The dataset generator currently supports:
 
@@ -107,7 +109,15 @@ Google Satellite Embedding index. Install only the feature groups you need with
 `pip install ".[visualization]"`. Zarr output is included in the full install
 and requirements file; install `pip install ".[storage]"` when starting from
 the minimal package. The installed command-line entry points are
-`geospatial-embeddings` and `geospatial-embeddings-dataset`.
+`geospatial-embeddings`, `geospatial-embeddings-dataset`, and
+`geospatial-embeddings-report`.
+
+Install the reporting stack separately when you only need post-processing and
+visualization:
+
+```bash
+pip install ".[reports]"
+```
 
 ## Supported Encoders
 
@@ -371,6 +381,41 @@ When plotting is enabled, the generator writes:
 
 The ICA fit is done on a capped subsample and transformed in batches, so large outputs remain tractable.
 
+## Visual Audit Reports
+
+`geospatial-embeddings-report` analyzes generated `.pt`, `.zarr`, and wide CSV
+artifacts without loading encoders, downloading models, or modifying the input
+datasets. It writes an offline HTML dashboard, publication-ready PNGs, a PDF,
+metric tables, and a reproducibility manifest.
+
+```bash
+geospatial-embeddings-report \
+  outputs/geoclip.zarr outputs/satclip.zarr \
+  --output-dir reports/geoclip_vs_satclip \
+  --analysis-sample-size 100000 \
+  --seed 42
+```
+
+The report includes spatial coverage and sampling-density maps, embedding
+atlases (PCA/ICA/UMAP), quality diagnostics, cross-encoder similarity and
+neighborhood-agreement metrics, temporal displacement views when compatible
+years are present, and geographic transects. Inputs with the same coordinates
+are compared by default even if their rows are ordered differently. Use nearest
+matching only deliberately, and record its tolerance in the report manifest:
+
+```bash
+geospatial-embeddings-report outputs/year_2023.zarr outputs/year_2024.zarr \
+  --output-dir reports/temporal \
+  --match-mode nearest \
+  --match-tolerance-km 1.0
+```
+
+Large Zarr artifacts are streamed for full-data quality summaries; expensive
+reductions and pairwise analyses use a deterministic equal-area sample. Pass
+`--no-umap` for a faster report or `--probes path/to/probes.json` to add custom
+transects. The report command refuses to overwrite an existing output directory
+unless `--overwrite` is supplied.
+
 ## Temporal Products
 
 The following products are temporal in this repo:
@@ -467,7 +512,9 @@ geospatial_embeddings_wrapper/
 ├── satclip/
 ├── scripts/
 │   ├── generate_dataset.py
+│   ├── generate_report.py
 │   └── get_embeddings.py
+├── reporting/
 ├── tests/
 ├── wrappers/
 │   ├── embedding_encoder.py

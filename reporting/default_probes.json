@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "probes": [
+    {
+      "name": "iberian_atlantic_to_mediterranean",
+      "description": "A coast-to-coast transect across the Iberian Peninsula.",
+      "coordinates": [[43.36, -8.41], [42.88, -5.65], [41.39, 2.17]],
+      "sample_count": 48
+    },
+    {
+      "name": "sahara_to_sahel",
+      "description": "North-to-south aridity gradient in north-west Africa.",
+      "coordinates": [[30.04, -6.84], [24.69, -3.97], [17.97, -1.02]],
+      "sample_count": 48
+    },
+    {
+      "name": "andes_east_west",
+      "description": "Pacific coast through the Andes into the Amazon basin.",
+      "coordinates": [[-12.05, -77.04], [-13.53, -71.97], [-12.05, -55.0]],
+      "sample_count": 48
+    },
+    {
+      "name": "european_latitude_band",
+      "description": "A west-to-east mid-latitude European gradient.",
+      "coordinates": [[48.86, -5.0], [48.86, 8.0], [48.86, 22.0]],
+      "sample_count": 48
+    },
+    {
+      "name": "us_mexico_border",
+      "description": "A border-following transect used to inspect spatial discontinuities.",
+      "coordinates": [[32.54, -117.04], [31.33, -106.49], [25.85, -97.5]],
+      "sample_count": 48
+    }
+  ]
+}

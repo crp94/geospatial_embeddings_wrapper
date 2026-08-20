@@ -16,6 +16,7 @@ dependencies = [
     "pyarrow>=14.0.0",
     "requests>=2.31.0",
     "torch>=2.2.0",
+    "tqdm>=4.65.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,14 @@ visualization = [
     "cartopy>=0.22.0",
     "matplotlib>=3.7.0",
 ]
+reports = [
+    "cartopy>=0.22.0",
+    "matplotlib>=3.7.0",
+    "plotly>=5.18.0",
+    "scikit-learn>=1.4.0",
+    "umap-learn>=0.5.5",
+    "zarr>=2.16.0",
+]
 storage = [
     "zarr>=2.16.0",
 ]
@@ -56,6 +65,7 @@ all = [
     "lightning>=2.0.0",
     "matplotlib>=3.7.0",
     "Pillow>=10.0.0",
+    "plotly>=5.18.0",
     "pyproj>=3.6.0",
     "rasterio>=1.4.0",
     "scikit-learn>=1.4.0",
@@ -63,14 +73,19 @@ all = [
     "torchgeo>=0.9.0",
     "torchvision>=0.17.0",
     "transformers>=4.30.0",
+    "umap-learn>=0.5.5",
     "zarr>=2.16.0",
 ]
 
 [project.scripts]
 geospatial-embeddings = "scripts.get_embeddings:main"
 geospatial-embeddings-dataset = "scripts.generate_dataset:main"
+geospatial-embeddings-report = "scripts.generate_report:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wrappers*", "satclip*", "scripts*"]
+include = ["reporting*", "wrappers*", "satclip*", "scripts*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+reporting = ["default_probes.json"]

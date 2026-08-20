@@ -17,6 +17,8 @@ shapely>=2.0.0
 rasterio>=1.4.0
 matplotlib>=3.7.0
 cartopy>=0.22.0
+plotly>=5.18.0
+umap-learn>=0.5.5
 
 # GeoCLIP dependencies
 geoclip>=1.0.0
