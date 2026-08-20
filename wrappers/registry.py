@@ -28,6 +28,10 @@ ENCODER_REGISTRY = {
     "torchspatial_rff": "wrappers.location_model_encoders:TorchSpatialRFFEncoder",
 }
 
+# Small, model-backed defaults for interactive point queries and examples.  The
+# full registry remains available to callers that explicitly select encoders.
+DEFAULT_ENCODER_NAMES = ("geoclip", "satclip")
+
 ENCODER_ALIASES = {
     "geoclip": "geoclip",
     "satclip": "satclip",

@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geospatial-embeddings-wrapper"
+version = "0.1.0"
+description = "Unified coordinate-based interfaces for geospatial embedding models and raster products."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Carlos" }]
+dependencies = [
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "pyarrow>=14.0.0",
+    "requests>=2.31.0",
+    "torch>=2.2.0",
+]
+
+[project.optional-dependencies]
+raster = [
+    "geopandas>=0.13.0",
+    "geotessera>=0.7.5",
+    "pyproj>=3.6.0",
+    "rasterio>=1.4.0",
+    "scikit-learn>=1.4.0",
+    "shapely>=2.0.0",
+    "torchgeo>=0.9.0",
+]
+models = [
+    "albumentations>=2.0.0",
+    "geoclip>=1.0.0",
+    "geopy>=2.3.0",
+    "huggingface_hub>=0.16.0",
+    "lightning>=2.0.0",
+    "Pillow>=10.0.0",
+    "torchvision>=0.17.0",
+    "transformers>=4.30.0",
+]
+visualization = [
+    "cartopy>=0.22.0",
+    "matplotlib>=3.7.0",
+]
+storage = [
+    "zarr>=2.16.0",
+]
+all = [
+    "albumentations>=2.0.0",
+    "cartopy>=0.22.0",
+    "geoclip>=1.0.0",
+    "geopandas>=0.13.0",
+    "geopy>=2.3.0",
+    "geotessera>=0.7.5",
+    "huggingface_hub>=0.16.0",
+    "lightning>=2.0.0",
+    "matplotlib>=3.7.0",
+    "Pillow>=10.0.0",
+    "pyproj>=3.6.0",
+    "rasterio>=1.4.0",
+    "scikit-learn>=1.4.0",
+    "shapely>=2.0.0",
+    "torchgeo>=0.9.0",
+    "torchvision>=0.17.0",
+    "transformers>=4.30.0",
+    "zarr>=2.16.0",
+]
+
+[project.scripts]
+geospatial-embeddings = "scripts.get_embeddings:main"
+geospatial-embeddings-dataset = "scripts.generate_dataset:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wrappers*", "satclip*", "scripts*"]
+namespaces = true

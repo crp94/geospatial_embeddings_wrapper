@@ -78,6 +78,30 @@ class GeoEmbeddingEncoder(ABC):
             )
         return torch.isfinite(embeddings).all(dim=1)
 
+    @staticmethod
+    def validate_coordinates(coordinates: torch.Tensor) -> torch.Tensor:
+        """Validate the public ``(latitude, longitude)`` coordinate contract.
+
+        This deliberately validates without moving data between devices or changing
+        precision, so callers can use it at every public boundary without altering
+        model behaviour.
+        """
+        if not isinstance(coordinates, torch.Tensor):
+            raise TypeError("coordinates must be a torch.Tensor")
+        if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+            raise ValueError(
+                "Expected coordinates with shape (N, 2) in (latitude, longitude) order, "
+                f"received {tuple(coordinates.shape)}"
+            )
+        if not torch.isfinite(coordinates).all():
+            raise ValueError("Coordinates must contain only finite values")
+        latitude, longitude = coordinates[:, 0], coordinates[:, 1]
+        if ((latitude < -90) | (latitude > 90)).any():
+            raise ValueError("Latitude values must be in the inclusive range [-90, 90]")
+        if ((longitude < -180) | (longitude > 180)).any():
+            raise ValueError("Longitude values must be in the inclusive range [-180, 180]")
+        return coordinates
+
     def supports_coverage_sampling(self) -> bool:
         """Whether the encoder can sample candidate coordinates from its own coverage."""
         return False
@@ -122,7 +146,7 @@ class GeoEmbeddingEncoder(ABC):
         Returns:
             Tensor of shape (N, embedding_dim) containing the embeddings
         """
-        coords_tensor = torch.Tensor(coordinates)
+        coords_tensor = self.validate_coordinates(torch.tensor(coordinates, dtype=torch.float32))
         return self.encode(coords_tensor)
 
     def encode_single(self, latitude: float, longitude: float) -> torch.Tensor:
@@ -136,7 +160,9 @@ class GeoEmbeddingEncoder(ABC):
         Returns:
             Tensor of shape (1, embedding_dim) containing the embedding
         """
-        coords = torch.Tensor([[latitude, longitude]])
+        coords = self.validate_coordinates(
+            torch.tensor([[latitude, longitude]], dtype=torch.float32)
+        )
         return self.encode(coords)
 
     @property

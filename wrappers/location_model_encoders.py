@@ -16,8 +16,10 @@ from __future__ import annotations
 import importlib
 import math
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -63,7 +65,7 @@ def _parse_data_root_spec(data_root: str | None) -> dict[str, str]:
 
 
 def _ensure_repo(repo_url: str, cache_name: str, data_root: str | None = None) -> Path:
-    """Return a local repository path, cloning to the cache when needed."""
+    """Return a local repository path, cloning atomically into the cache when needed."""
     if data_root:
         repo_path = Path(data_root).expanduser()
         if not repo_path.exists():
@@ -76,13 +78,26 @@ def _ensure_repo(repo_url: str, cache_name: str, data_root: str | None = None) -
 
     EXTERNAL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(repo_path)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        # Cloning into a sibling staging directory avoids leaving a partial
+        # repository behind if the network fails or the process is interrupted.
+        with tempfile.TemporaryDirectory(
+            prefix=f".{cache_name}.", dir=EXTERNAL_CACHE_ROOT
+        ) as staging_root:
+            staged_repo = Path(staging_root) / cache_name
+            subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url, str(staged_repo)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                staged_repo.replace(repo_path)
+            except FileExistsError:
+                # A concurrent process populated the cache while this process
+                # was cloning. Its completed cache is safe to reuse.
+                if not repo_path.exists():
+                    raise
     except Exception as exc:
         raise RuntimeError(
             f"Could not clone {repo_url} into {repo_path}. "
@@ -90,6 +105,50 @@ def _ensure_repo(repo_url: str, cache_name: str, data_root: str | None = None) -
             f"{cache_name}=repo=/path/to/repo or install it on PYTHONPATH."
         ) from exc
     return repo_path
+
+
+def _download_url_atomic(
+    url: str,
+    destination: Path,
+    *,
+    validator: Any | None = None,
+    attempts: int = 3,
+) -> None:
+    """Download a URL to a validated temporary file then atomically promote it."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for _attempt in range(1, attempts + 1):
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{destination.name}.",
+                suffix=".part",
+                dir=destination.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+            urllib.request.urlretrieve(url, temporary_path)
+            if validator is not None:
+                validator(temporary_path)
+            temporary_path.replace(destination)
+            return
+        except Exception as exc:
+            last_error = exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"Could not download a valid file from {url} after {attempts} attempts."
+    ) from last_error
+
+
+def _validate_zip(path: Path) -> None:
+    """Reject malformed or truncated ZIP archives before they enter the cache."""
+    with zipfile.ZipFile(path) as archive:
+        bad_member = archive.testzip()
+    if bad_member is not None:
+        raise zipfile.BadZipFile(f"CRC check failed for ZIP member: {bad_member}")
 
 
 def _prepend_sys_path(path: Path) -> None:
@@ -250,20 +309,54 @@ class CSPEncoder(GeoEmbeddingEncoder):
 
         cache_dir.mkdir(parents=True, exist_ok=True)
         archive_path = cache_dir / "model_dir.zip"
+        if archive_path.exists():
+            try:
+                _validate_zip(archive_path)
+            except Exception:
+                archive_path.unlink(missing_ok=True)
+
         if not archive_path.exists():
             try:
-                urllib.request.urlretrieve(CSP_MODEL_URL, archive_path)
+                _download_url_atomic(
+                    CSP_MODEL_URL,
+                    archive_path,
+                    validator=_validate_zip,
+                )
             except Exception as exc:
                 raise RuntimeError(
-                    "Could not download CSP pretrained checkpoints. Pass a local "
-                    "checkpoint with --encoder_root csp=checkpoint=/path/to/model.pth.tar."
+                    "Could not download a valid CSP pretrained checkpoint archive. "
+                    "Pass a local checkpoint with --encoder_root "
+                    "csp=checkpoint=/path/to/model.pth.tar."
                 ) from exc
 
         try:
             with zipfile.ZipFile(archive_path) as archive:
-                archive.extractall(cache_dir)
+                # Extract only the requested known member into a temporary file.
+                # This avoids ZIP path traversal and guarantees an interrupted
+                # extraction cannot leave a partial checkpoint in the cache.
+                member = archive.getinfo(CSP_CHECKPOINTS[variant])
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{checkpoint.name}.",
+                    suffix=".part",
+                    dir=checkpoint.parent,
+                    delete=False,
+                ) as temporary_file:
+                    temporary_checkpoint = Path(temporary_file.name)
+                    try:
+                        shutil.copyfileobj(source, temporary_file)
+                        temporary_file.flush()
+                        os.fsync(temporary_file.fileno())
+                    except Exception:
+                        temporary_checkpoint.unlink(missing_ok=True)
+                        raise
+                temporary_checkpoint.replace(checkpoint)
         except Exception as exc:
-            raise RuntimeError(f"Could not extract CSP checkpoint archive: {archive_path}") from exc
+            raise RuntimeError(
+                f"Could not extract CSP checkpoint '{CSP_CHECKPOINTS[variant]}' "
+                f"from archive: {archive_path}"
+            ) from exc
 
         if not checkpoint.exists():
             raise RuntimeError(

@@ -4,19 +4,23 @@
   <img src="images/image.png" alt="Geospatial Embeddings Illustration" width="600">
 </p>
 
-Unified tooling for generating geospatial embeddings from coordinates and for building large land-only embedding datasets with a consistent output format.
+Unified tooling for querying geospatial encoders at coordinates and building
+reproducible land-only embedding datasets with explicit coordinate and provenance
+metadata.
 
 ## Overview
 
 This repository has two main entry points:
 
-- `scripts/get_embeddings.py`: small point-query CLI for `geoclip` and `satclip`
-- `scripts/generate_dataset.py`: land-only dataset generator with support for coordinate models, raster products, and deterministic baselines
+- `scripts/get_embeddings.py`: point-query CLI for every registered encoder
+- `scripts/generate_dataset.py`: reproducible land-only dataset generator for
+  coordinate models, raster products, and deterministic baselines
 
 The dataset generator currently supports:
 
 - `geoclip`
 - `satclip`
+- `lgnd_clay`
 - `copernicus_embed`
 - `tessera`
 - `google_satellite_embedding`
@@ -35,21 +39,26 @@ The dataset generator currently supports:
 - `torchspatial_theory`
 - `torchspatial_rff`
 
-All dataset outputs use the same coordinate conventions and save format, even though the underlying models and products use different native coordinate orders and storage layouts.
+All dataset outputs use the same coordinate conventions and named embedding
+fields, even though the underlying models and products use different native
+coordinate orders and storage layouts.
 
 ## What The Generator Does
 
 `scripts/generate_dataset.py`:
 
 - samples candidate coordinates with Fibonacci sphere sampling
-- randomizes the Fibonacci phase per run, so repeated runs do not reuse the exact same locations
-- filters to land using Natural Earth polygons
+- uses a seeded Fibonacci sampler, or reusable coordinates supplied by the user
+- filters to land using a selected Natural Earth polygon resolution
 - queries one or more encoders
 - drops invalid rows for the selected encoder set
-- writes `.pt` or `.csv` datasets
+- writes `.pt`, `.csv`, or chunked `.zarr` datasets
 - writes location plots and ICA-to-RGB embedding plots
 
-For temporal products, the generator can emit `YYYY.pt` files, one per year.
+For temporal products, the generator can emit one output per year.
+
+Requested encoders are initialized fail-fast: if any one cannot be created, the
+run stops before writing a partial dataset.
 
 ## Coordinate Conventions
 
@@ -64,6 +73,7 @@ Saved dataset files include both explicit coordinate layouts:
 - separate `latitude` and `longitude` tensors/vectors
 
 For `.pt` outputs, the metadata block records these conventions explicitly.
+The point-query CLI uses the same layouts in both `.pt` and `.npz` outputs.
 
 ## Installation
 
@@ -82,19 +92,31 @@ cd geospatial_embeddings_wrapper
 python -m venv .venv
 source .venv/bin/activate
 
-pip install -r requirements.txt
+# Full installation, including raster products, model-backed encoders, and plots.
+pip install ".[all]"
+
+# The original requirements-file workflow remains supported.
+# pip install -r requirements.txt
 ```
 
 `satclip/` is vendored in this repository already. You do not need to clone it separately.
+
+The base package installs the shared API and the Parquet engine needed for the
+Google Satellite Embedding index. Install only the feature groups you need with
+`pip install ".[raster]"`, `pip install ".[models]"`, or
+`pip install ".[visualization]"`. Zarr output is included in the full install
+and requirements file; install `pip install ".[storage]"` when starting from
+the minimal package. The installed command-line entry points are
+`geospatial-embeddings` and `geospatial-embeddings-dataset`.
 
 ## Supported Encoders
 
 ### Point-query CLI
 
-`scripts/get_embeddings.py` currently supports:
-
-- `geoclip`
-- `satclip`
+`scripts/get_embeddings.py` accepts every canonical name and alias in
+`wrappers/registry.py`. Its lightweight defaults remain `geoclip satclip`.
+Use `--encoder-root ENCODER=PATH` repeatedly for local data or checkpoint
+specifications, and pass `--year` when querying a temporal encoder.
 
 Example:
 
@@ -106,12 +128,19 @@ python scripts/get_embeddings.py \
   --output embeddings.npz
 ```
 
+Coordinates are always `(latitude, longitude)`, must be finite, and must be in
+the inclusive ranges `[-90, 90]` and `[-180, 180]`. Supply either paired
+`--lat`/`--lon` values or `--input`, never both. JSON input accepts coordinate
+pairs or `lat`/`lon` objects; CSV and text input accept the first two numeric
+columns or columns headed `lat`/`lon` (or `latitude`/`longitude`).
+
 ### Dataset Generator
 
 `scripts/generate_dataset.py` supports:
 
 - `geoclip`
 - `satclip`
+- `lgnd_clay`
 - `copernicus_embed`
 - `tessera`
 - `google_satellite_embedding`
@@ -133,6 +162,8 @@ python scripts/get_embeddings.py \
 Notes:
 
 - `geoclip` and `satclip` are model-backed encoders
+- `lgnd_clay`, `copernicus_embed`, `tessera`, and
+  `google_satellite_embedding` are raster-backed products
 - `copernicus_embed` is TorchGeo-backed and auto-downloads its raster
 - `tessera` can run through `geotessera` without a local root
 - `google_satellite_embedding` can run against the public AEF annual index without a local root
@@ -166,6 +197,39 @@ python scripts/generate_dataset.py \
   --output_path outputs/example_static
 ```
 
+Make a sampled coordinate set reproducible and reuse it across separate encoder
+runs. `--coordinates_in` uses the supplied points exactly: rows outside an
+encoder's coverage cause a clear error rather than being silently replaced.
+
+```bash
+# Sample once and retain the exact selected land points.
+python scripts/generate_dataset.py \
+  --n_points 100000 \
+  --encoders geoclip \
+  --seed 20260820 \
+  --coordinates_out outputs/shared_coordinates.npz \
+  --output_path outputs/geoclip
+
+# Query another encoder at precisely those locations.
+python scripts/generate_dataset.py \
+  --encoders satclip \
+  --coordinates_in outputs/shared_coordinates.npz \
+  --output_path outputs/satclip
+```
+
+For a large multi-encoder run, Zarr streams batches into chunked arrays rather
+than retaining the complete embedding matrix in memory:
+
+```bash
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders geoclip satclip \
+  --seed 20260820 \
+  --output_format zarr \
+  --no_plot \
+  --output_path outputs/land_embeddings
+```
+
 Generate a 2024 land-only dataset for the 3 temporal/raster products:
 
 ```bash
@@ -196,6 +260,10 @@ python scripts/generate_dataset.py \
   --no_plot \
   --output_path outputs/geoclip_csv
 ```
+
+CSV expands every embedding dimension into a separate column, so reserve it for
+small, interoperability-focused exports. Prefer `.pt` for ordinary PyTorch
+workflows and `.zarr` for large datasets or incremental reads.
 
 Generate the additional coordinate-only encoders:
 
@@ -235,11 +303,11 @@ python scripts/generate_dataset.py \
   --output_path outputs/land_only_500k/torchspatial_baselines_land_500k
 ```
 
-## Output Format
+## Outputs and Provenance
 
 ### `.pt` output
 
-Each saved dataset contains:
+Each saved `.pt` dataset contains:
 
 - `metadata`
 - `latitude`
@@ -272,6 +340,27 @@ The metadata block includes:
 - number of points
 - coordinate order declarations
 - encoder-specific metadata such as embedding dimension and available years
+- sampling seed and maximum sampling-attempt limit
+- land-mask source, resolution, and Antarctica policy
+
+The same metadata is saved as `metadata_json` in point-query `.npz` output and
+as the `metadata` group attribute in Zarr output.
+
+### `.zarr` output
+
+Zarr stores the same named arrays as `.pt` (`latitude`, `longitude`, all three
+coordinate layouts, and `<encoder>_embeddings`) in independently chunked,
+float32 arrays. It is the preferred format for hundreds of thousands of points
+or high-dimensional/multi-encoder datasets because data can be read in chunks.
+Plots are skipped for streamed Zarr sampling; create visualizations from a
+deterministic subset in a separate analysis step.
+
+### Point-query output compatibility
+
+Point queries retain their legacy top-level encoder keys/arrays. Both `.pt` and
+`.npz` now also retain the submitted coordinates under `coordinates`,
+`coordinates_latlon`, `coordinates_lonlat`, `latitude`, and `longitude`, so
+outputs can be joined safely with generated datasets.
 
 ### Plots
 
@@ -291,7 +380,7 @@ The following products are temporal in this repo:
 
 `copernicus_embed` is treated as a fixed annual product with reference year `2021`.
 
-If you pass `--years`, the generator creates one file per requested year:
+If you pass `--years`, the generator creates one output per requested year:
 
 ```bash
 python scripts/generate_dataset.py \
@@ -305,6 +394,8 @@ This produces:
 
 - `outputs/temporal_pair_2023.pt`
 - `outputs/temporal_pair_2024.pt`
+
+The date-specific output names use the selected extension (or `.zarr` directory).
 
 ## Architecture
 
@@ -325,22 +416,35 @@ Canonical encoder names and aliases are centralized in `wrappers/registry.py`.
 Run the test suite with:
 
 ```bash
-./.venv/bin/python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 Quick syntax check:
 
 ```bash
-python3 -m py_compile scripts/generate_dataset.py wrappers/torchgeo_encoders.py tests/test_generate_dataset.py
+python -m py_compile scripts/get_embeddings.py scripts/generate_dataset.py wrappers/*.py tests/test_*.py
 ```
 
 ## Practical Notes
 
-- Running the 5 encoders separately with the same `--n_points` does not produce the same coordinates, because the Fibonacci sampler is now randomized per run.
-- If you need the exact same coordinates across multiple encoder outputs, add a fixed coordinate export/reuse workflow instead of relying on repeated sampling.
+- Use `--seed` to reproduce the generator's candidate sampling and valid-row
+  selection, subject to stable encoder/data versions. The saved metadata records
+  the seed and land-mask policy.
+- Use `--coordinates_out` followed by `--coordinates_in` when comparing separate
+  encoder runs. This is stronger than matching a seed: it guarantees the exact
+  same submitted coordinates.
+- Without `--include_antarctica`, the land filter excludes points at or below
+  latitude `-60` before testing against Natural Earth polygons. This preserves
+  the historical policy. Choose `--land_resolution 110m`, `50m`, or `10m`
+  deliberately: resolution affects coastlines and small islands. Polygon
+  boundaries are not considered land (`contains` semantics).
+- Sampling has a bounded `--max_sampling_attempts` limit (default 100) and
+  reports candidate/valid counts on failure. If coverage is sparse, reduce the
+  requested size, select a compatible year, adjust land-mask policy, or raise
+  the limit intentionally.
 - `geoclip` and `satclip` are much faster than the large raster-backed products.
 - `tessera` and `google_satellite_embedding` may need substantial network and disk activity on first use.
-- `google_satellite_embedding` uses the public AEF annual index and remote GeoTIFF access.
+- `google_satellite_embedding` uses the public AEF annual index and remote GeoTIFF access. Its index is downloaded to a temporary file, validated as Parquet, and atomically promoted into the cache; a corrupt cached index is automatically replaced.
 
 ## Licensing Notes
 

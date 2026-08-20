@@ -3,6 +3,10 @@ torch>=2.2.0
 torchvision>=0.17.0
 numpy>=1.26.0
 pandas>=2.1.0
+# pandas.read_parquet() is used by the Google Satellite Embedding index loader.
+# Declare a concrete engine rather than relying on a transitive installation.
+pyarrow>=14.0.0
+zarr>=2.16.0
 scikit-learn>=1.4.0
 tqdm>=4.65.0
 

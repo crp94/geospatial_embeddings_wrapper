@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Any
 from pathlib import Path
 import logging
+import os
+import tempfile
 import time
 
 import geopandas as gpd
@@ -470,6 +472,15 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
     temporal = True
     batch_size = 250000
     index_url = "https://data.source.coop/tge-labs/aef/v1/annual/aef_index.parquet"
+    remote_index_download_attempts = 3
+    remote_index_columns = (
+        "year",
+        "path",
+        "wgs84_west",
+        "wgs84_south",
+        "wgs84_east",
+        "wgs84_north",
+    )
     remote_rasterio_env = {
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
@@ -502,25 +513,101 @@ class GoogleSatelliteEmbeddingEncoder(TorchGeoRasterPointEncoder):
         self._sampling_bounds_by_year = self._build_sampling_bounds()
 
     def _ensure_remote_index(self) -> None:
+        """Ensure the cached annual index is a complete, readable Parquet file.
+
+        Never write directly to the cache path: an interrupted process must not
+        make a partial index look like a valid cached download on the next run.
+        """
         if self._index_path.exists():
-            return
+            try:
+                self._validate_remote_index(self._index_path)
+                return
+            except Exception as exc:
+                LOGGER.warning(
+                    "Discarding invalid Google Satellite Embedding index cache %s: %s",
+                    self._index_path,
+                    exc,
+                )
+                self._index_path.unlink(missing_ok=True)
 
-        response = requests.get(self.index_url, stream=True, timeout=120)
-        response.raise_for_status()
-        with open(self._index_path, "wb") as file_handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    file_handle.write(chunk)
+        last_error: Exception | None = None
+        for attempt in range(1, self.remote_index_download_attempts + 1):
+            temporary_path: Path | None = None
+            response = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{self._index_path.name}.",
+                    suffix=".part",
+                    dir=self._index_path.parent,
+                    delete=False,
+                ) as file_handle:
+                    temporary_path = Path(file_handle.name)
+                    response = requests.get(self.index_url, stream=True, timeout=120)
+                    response.raise_for_status()
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            file_handle.write(chunk)
+                    file_handle.flush()
+                    os.fsync(file_handle.fileno())
 
-    def _load_remote_index(self, path: Path) -> dict[int, gpd.GeoDataFrame]:
-        columns = [
-            "year",
-            "path",
+                self._validate_remote_index(temporary_path)
+                temporary_path.replace(self._index_path)
+                LOGGER.info("Cached Google Satellite Embedding index at %s", self._index_path)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.remote_index_download_attempts:
+                    LOGGER.warning(
+                        "Google Satellite Embedding index download attempt %d/%d failed: %s",
+                        attempt,
+                        self.remote_index_download_attempts,
+                        exc,
+                    )
+            finally:
+                if response is not None:
+                    response.close()
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+        raise RuntimeError(
+            "Could not download a valid Google Satellite Embedding index after "
+            f"{self.remote_index_download_attempts} attempts: {self.index_url}"
+        ) from last_error
+
+    @classmethod
+    def _validate_remote_index(cls, path: Path) -> None:
+        """Check that a downloaded index has the columns required by this adapter."""
+        index_df = pd.read_parquet(path, columns=list(cls.remote_index_columns))
+        if index_df.empty:
+            raise ValueError("the Parquet index has no rows")
+        bounds_columns = [
             "wgs84_west",
             "wgs84_south",
             "wgs84_east",
             "wgs84_north",
         ]
+        bounds = index_df[bounds_columns].apply(pd.to_numeric, errors="coerce")
+        if (
+            index_df["year"].isna().any()
+            or index_df["path"].isna().any()
+            or bounds.isna().any().any()
+        ):
+            raise ValueError("the Parquet index has missing required values")
+        if not np.isfinite(bounds.to_numpy()).all():
+            raise ValueError("the Parquet index has non-finite WGS84 bounds")
+        if (
+            (bounds["wgs84_west"] > bounds["wgs84_east"]).any()
+            or (bounds["wgs84_south"] > bounds["wgs84_north"]).any()
+            or (bounds["wgs84_west"] < -180).any()
+            or (bounds["wgs84_east"] > 180).any()
+            or (bounds["wgs84_south"] < -90).any()
+            or (bounds["wgs84_north"] > 90).any()
+        ):
+            raise ValueError("the Parquet index has invalid WGS84 bounds")
+
+    def _load_remote_index(self, path: Path) -> dict[int, gpd.GeoDataFrame]:
+        columns = list(self.remote_index_columns)
         index_df = pd.read_parquet(path, columns=columns)
         index_df["filepath"] = index_df["path"].str.replace(
             "s3://us-west-2.opendata.source.coop/",
