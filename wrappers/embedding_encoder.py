@@ -62,6 +62,45 @@ class GeoEmbeddingEncoder(ABC):
         """Whether the encoder exposes year-specific embeddings."""
         return False
 
+    @staticmethod
+    def validate_years(years: Any, n_rows: int) -> np.ndarray:
+        """Validate a per-row year array against a coordinate batch of ``n_rows``."""
+        if isinstance(years, torch.Tensor):
+            years = years.detach().cpu().numpy()
+        array = np.asarray(years)
+        if array.ndim != 1 or array.shape[0] != n_rows:
+            raise ValueError(
+                f"Expected one year per coordinate row ({n_rows}), received shape {tuple(array.shape)}"
+            )
+        if array.dtype.kind == "f":
+            if not np.isfinite(array).all() or not np.all(np.equal(np.mod(array, 1), 0)):
+                raise ValueError("Per-row years must be finite integers")
+        elif array.dtype.kind not in "iu":
+            raise ValueError("Per-row years must be integers")
+        return array.astype(np.int64)
+
+    def encode_with_years(self, coordinates: torch.Tensor, years: Any) -> torch.Tensor:
+        """Encode coordinates when every row carries its own year.
+
+        The default groups rows by unique year and delegates to :meth:`encode`, so
+        any temporal encoder supports per-row years.  Encoders whose backend
+        accepts a year vector natively should override this with one call.
+        """
+        year_array = self.validate_years(years, coordinates.shape[0])
+        if year_array.shape[0] == 0 or not self.is_temporal():
+            # Static encoders ignore the year: one call, no grouping.
+            return self.encode(coordinates)
+        output: torch.Tensor | None = None
+        for year in np.unique(year_array):
+            mask = torch.from_numpy(year_array == year)
+            embeddings = self.encode(coordinates[mask], year=int(year))
+            if output is None:
+                output = torch.empty(
+                    (coordinates.shape[0], embeddings.shape[1]), dtype=embeddings.dtype
+                )
+            output[mask] = embeddings.to(output.dtype)
+        return output
+
     def get_available_years(self) -> list[int] | None:
         """Return available years for temporal encoders."""
         return None

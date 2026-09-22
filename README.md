@@ -40,6 +40,8 @@ The dataset generator currently supports:
 - `torchspatial_grid`
 - `torchspatial_theory`
 - `torchspatial_rff`
+- `terranova`
+- `terranova_spatial`
 
 All dataset outputs use the same coordinate conventions and named embedding
 fields, even though the underlying models and products use different native
@@ -144,6 +146,25 @@ the inclusive ranges `[-90, 90]` and `[-180, 180]`. Supply either paired
 pairs or `lat`/`lon` objects; CSV and text input accept the first two numeric
 columns or columns headed `lat`/`lon` (or `latitude`/`longitude`).
 
+Temporal encoders take `--year` with either one value, applied to every
+coordinate, or exactly one value per coordinate:
+
+```bash
+python scripts/get_embeddings.py \
+  --lat 41.9 -33.9 40.7 \
+  --lon 12.5 151.2 -74.0 \
+  --encoders terranova \
+  --year 1950 2015 2030 \
+  --output embeddings.npz
+```
+
+Input files can carry the year themselves: a `year` field on JSON objects, a
+top-level `year` array next to `latitude`/`longitude`, or a `year` column in
+CSV/text input. Years must be present for every row or for none, and cannot be
+combined with `--year`. Whenever a year is known, the output stores a per-row
+`year` array and the metadata records `year_mode` (`static`, `scalar`, or
+`per_row`) plus `year_range` for per-row runs. Static encoders ignore years.
+
 ### Dataset Generator
 
 `scripts/generate_dataset.py` supports:
@@ -168,6 +189,8 @@ columns or columns headed `lat`/`lon` (or `latitude`/`longitude`).
 - `torchspatial_grid`
 - `torchspatial_theory`
 - `torchspatial_rff`
+- `terranova`
+- `terranova_spatial`
 
 Notes:
 
@@ -182,6 +205,7 @@ Notes:
 - `csp_fmow`, `csp_fmow_unsuper`, `csp_inat`, and `csp_inat_unsuper` select the other published CSP variants
 - `gtloc` wraps the open-weight GT-Loc GPS branch
 - `torchspatial_*` encoders are deterministic coordinate-feature baselines and do not require pretrained weights
+- `terranova` wraps the TerraNova foundation model (`crp94/terranova` on the Hugging Face Hub); it returns the 256-d spatiotemporal embedding and is temporal over 1900-2035, so pass `--year`/`--years` (the point-query default is 2015). `terranova_spatial` returns the year-independent 256-d spatial embedding
 - land-only behavior is enforced by this generator layer, not by every source dataset
 
 ### Checkpoints For New Models
@@ -192,6 +216,7 @@ The new coordinate-only wrappers do not vendor pretrained weights in this reposi
 - `csp*`: pass a local CSP `.pth.tar` checkpoint with `checkpoint=...` if the Dropbox auto-download is not available or if you want a specific CSP variant/checkpoint
 - `gtloc`: always requires a local GT-Loc checkpoint via `checkpoint=...`
 - `torchspatial_*`: no checkpoint is required
+- `terranova` / `terranova_spatial`: weights are downloaded automatically from `crp94/terranova` through the `terranova` package (`pip install git+https://github.com/crp94/terranova-model`, included in `.[models]`). Point at a local snapshot with `repo=/path/to/snapshot`, or pin `revision=...`, `cache=...`, `space=...`, `batch_size=...`
 
 Use `--encoder_root` for these paths. It accepts either `encoder=/plain/path` or a semicolon-separated spec such as `encoder=repo=/path/to/repo;checkpoint=/path/to/model.pt`.
 
@@ -226,6 +251,25 @@ python scripts/generate_dataset.py \
   --coordinates_in outputs/shared_coordinates.npz \
   --output_path outputs/satclip
 ```
+
+Supplied coordinates can also carry one year per row: a `year` column in CSV, or
+a `year` array in `.npz`/`.pt` input. The generator then embeds each row at its
+own year, writes a single output (no year suffix) with a per-row `year`
+array/column, validates every distinct year against the temporal encoders, and
+rejects `--years` for that run. `--coordinates_out` preserves the years so the
+same rows can be re-queried with another encoder:
+
+```bash
+# points.csv: latitude,longitude,year
+python scripts/generate_dataset.py \
+  --encoders terranova \
+  --coordinates_in points.csv \
+  --coordinates_out outputs/points_with_years.npz \
+  --output_path outputs/terranova_per_row_years
+```
+
+Encoders whose backend accepts a year vector (TerraNova) embed all rows in one
+call; other temporal encoders are queried once per distinct year.
 
 For a large multi-encoder run, Zarr streams batches into chunked arrays rather
 than retaining the complete embedding matrix in memory:
@@ -313,6 +357,24 @@ python scripts/generate_dataset.py \
   --output_path outputs/land_only_500k/torchspatial_baselines_land_500k
 ```
 
+Generate TerraNova embeddings. The spatiotemporal space is year-specific, so
+constrain the run with `--years`; the spatial space is static:
+
+```bash
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders terranova \
+  --years 2015 \
+  --device cuda \
+  --output_path outputs/land_only_500k/terranova_land_500k
+
+python scripts/generate_dataset.py \
+  --n_points 500000 \
+  --encoders terranova_spatial \
+  --device cuda \
+  --output_path outputs/land_only_500k/terranova_spatial_land_500k
+```
+
 ## Outputs and Provenance
 
 ### `.pt` output
@@ -325,6 +387,7 @@ Each saved `.pt` dataset contains:
 - `coordinates`
 - `coordinates_latlon`
 - `coordinates_lonlat`
+- `year` (per-row, when the run had a scalar or per-row year)
 - one `*_embeddings` tensor per encoder
 
 Example keys:
@@ -346,7 +409,7 @@ Example keys:
 The metadata block includes:
 
 - selected encoders
-- year
+- year, `year_mode` (`static`, `scalar`, or `per_row`), and `year_range` for per-row runs
 - number of points
 - coordinate order declarations
 - encoder-specific metadata such as embedding dimension and available years
@@ -422,8 +485,13 @@ The following products are temporal in this repo:
 
 - `tessera`
 - `google_satellite_embedding`
+- `terranova` (years 1900-2035; after 2025 is extrapolation)
 
 `copernicus_embed` is treated as a fixed annual product with reference year `2021`.
+
+When no `--years` are given, the generator enumerates every year shared by the
+selected temporal encoders. It refuses to do so implicitly for more than 10
+years, so long-range encoders such as `terranova` require explicit `--years`.
 
 If you pass `--years`, the generator creates one output per requested year:
 
@@ -452,6 +520,7 @@ The main implementation split is:
 - `wrappers/satclip_encoder.py`
 - `wrappers/torchgeo_encoders.py`
 - `wrappers/location_model_encoders.py`
+- `wrappers/terranova_encoder.py`
 - `wrappers/registry.py`
 
 Canonical encoder names and aliases are centralized in `wrappers/registry.py`.
@@ -500,6 +569,7 @@ Licensing is not uniform across the supported products.
 - `tessera` embeddings in TorchGeo: CC0-1.0
 - `copernicus_embed`: CC-BY-4.0
 - `google_satellite_embedding`: CC-BY-4.0
+- `terranova` weights: CC-BY-4.0 (cite arXiv:2607.29527)
 
 For the CC-BY products, attribution is required.
 
@@ -521,6 +591,8 @@ geospatial_embeddings_wrapper/
 │   ├── geoclip_encoder.py
 │   ├── satclip_encoder.py
 │   ├── torchgeo_encoders.py
+│   ├── location_model_encoders.py
+│   ├── terranova_encoder.py
 │   └── registry.py
 ├── README.md
 └── requirements.txt

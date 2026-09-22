@@ -202,6 +202,23 @@ class GenerateDatasetTests(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_encode_with_years_groups_rows_by_year_and_preserves_order(self):
+        encoder = DummyTemporalEncoder([2000, 2010, 2020])
+        coords = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        years = np.array([2020, 2000, 2020, 2010])
+
+        embeddings = encoder.encode_with_years(coords, years)
+
+        expected = torch.tensor(
+            [[1.0, 2.0, 2020.0], [3.0, 4.0, 2000.0], [5.0, 6.0, 2020.0], [7.0, 8.0, 2010.0]]
+        )
+        torch.testing.assert_close(embeddings, expected)
+
+    def test_encode_with_years_rejects_mismatched_length(self):
+        encoder = DummyTemporalEncoder([2000])
+        with self.assertRaises(ValueError):
+            encoder.encode_with_years(torch.zeros((3, 2)), np.array([2000, 2000]))
+
     def test_resolve_years_uses_intersection_for_temporal_encoders(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             generator = GeospatialDatasetGenerator(cache_dir=tmpdir)
@@ -212,6 +229,24 @@ class GenerateDatasetTests(unittest.TestCase):
             }
 
             self.assertEqual(generator.resolve_years(), [2021, 2022])
+
+    def test_resolve_years_refuses_to_enumerate_large_year_ranges_implicitly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generator = GeospatialDatasetGenerator(cache_dir=tmpdir)
+            generator.encoders = {"wide": DummyTemporalEncoder(list(range(1900, 2036)))}
+
+            with self.assertRaises(RuntimeError) as ctx:
+                generator.resolve_years()
+            self.assertIn("--years", str(ctx.exception))
+            self.assertIn("136", str(ctx.exception))
+
+            self.assertEqual(generator.resolve_years([2015]), [2015])
+
+    def test_resolve_years_still_enumerates_small_year_ranges_implicitly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generator = GeospatialDatasetGenerator(cache_dir=tmpdir)
+            generator.encoders = {"narrow": DummyTemporalEncoder(list(range(2017, 2027)))}
+            self.assertEqual(generator.resolve_years(), list(range(2017, 2027)))
 
     def test_generate_dataset_writes_yearly_pt_files_with_explicit_coordinates(self):
         batches = [
@@ -397,6 +432,95 @@ class GenerateDatasetTests(unittest.TestCase):
                 loaded_latitude, loaded_longitude = generator.load_coordinates(path)
                 np.testing.assert_allclose(loaded_latitude, latitude)
                 np.testing.assert_allclose(loaded_longitude, longitude)
+
+    def test_coordinate_export_round_trips_per_row_years(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generator = GeospatialDatasetGenerator(cache_dir=tmpdir)
+            latitude = np.array([1.0, -2.0], dtype=np.float32)
+            longitude = np.array([3.0, -4.0], dtype=np.float32)
+            years = np.array([1990, 2020])
+
+            npz_path = generator.save_coordinates(latitude, longitude, f"{tmpdir}/c", years=years)
+            csv_path = generator.save_coordinates(latitude, longitude, f"{tmpdir}/c.csv", years=years)
+            pt_path = f"{tmpdir}/c.pt"
+            torch.save({"coordinates_latlon": torch.tensor([[1.0, 3.0], [-2.0, -4.0]]), "year": torch.tensor([1990, 2020])}, pt_path)
+
+            for path in (npz_path, csv_path, pt_path):
+                loaded_lat, loaded_lon, loaded_years = generator.load_coordinates_with_years(path)
+                np.testing.assert_allclose(loaded_lat, latitude)
+                np.testing.assert_allclose(loaded_lon, longitude)
+                np.testing.assert_array_equal(loaded_years, years)
+                # the pair-only reader keeps its contract
+                self.assertEqual(len(generator.load_coordinates(path)), 2)
+
+            plain = generator.save_coordinates(latitude, longitude, f"{tmpdir}/plain")
+            self.assertIsNone(generator.load_coordinates_with_years(plain)[2])
+
+    def test_resolve_years_with_per_row_years_validates_and_rejects_years_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generator = GeospatialDatasetGenerator(cache_dir=tmpdir)
+            generator.encoders = {"temporal": DummyTemporalEncoder([2020, 2021]), "static": DummyStaticEncoder()}
+
+            self.assertEqual(generator.resolve_years(per_row_years=np.array([2020, 2021, 2020])), [None])
+            with self.assertRaisesRegex(ValueError, "2019"):
+                generator.resolve_years(per_row_years=np.array([2019, 2020]))
+            with self.assertRaisesRegex(ValueError, "--years"):
+                generator.resolve_years([2020], per_row_years=np.array([2020, 2021]))
+
+    def test_generate_dataset_with_per_row_years_writes_single_output_with_year_column(self):
+        generator = SequenceGenerator(batches=[])
+        generator.encoders = {
+            "static": DummyStaticEncoder(),
+            "temporal": DummyTemporalEncoder([2020, 2021]),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            coords_path = generator.save_coordinates(
+                np.array([1.0, 2.0, 3.0]), np.array([10.0, 20.0, 30.0]),
+                f"{tmpdir}/coords", years=np.array([2021, 2020, 2021]),
+            )
+            try:
+                import zarr  # noqa: F401
+                formats = ("pt", "csv", "zarr")
+            except ImportError:  # pragma: no cover - optional dependency
+                formats = ("pt", "csv")
+            for output_format in formats:
+                prefix = str(Path(tmpdir) / f"ds_{output_format}")
+                outputs = generator.generate_dataset(
+                    output_path=prefix, output_format=output_format, plot_results=False,
+                    coordinates_in=coords_path, coordinates_out=f"{tmpdir}/out_{output_format}.npz",
+                )
+                self.assertEqual(outputs, [f"{prefix}.{output_format}"])
+                if output_format == "pt":
+                    data = torch.load(outputs[0], weights_only=False)
+                    torch.testing.assert_close(data["year"], torch.tensor([2021, 2020, 2021]))
+                    np.testing.assert_allclose(data["temporal_embeddings"][:, 2].numpy(), [2021.0, 2020.0, 2021.0])
+                    np.testing.assert_allclose(data["static_embeddings"][:, 2].numpy(), [0.0, 0.0, 0.0])
+                    metadata = data["metadata"]
+                elif output_format == "csv":
+                    import pandas as pd
+                    frame = pd.read_csv(outputs[0])
+                    self.assertEqual(frame["year"].tolist(), [2021, 2020, 2021])
+                    self.assertEqual(frame["temporal_emb_0002"].tolist(), [2021.0, 2020.0, 2021.0])
+                    metadata = None
+                else:
+                    import json
+                    import zarr
+                    group = zarr.open_group(outputs[0], mode="r")
+                    np.testing.assert_array_equal(np.asarray(group["year"]), [2021, 2020, 2021])
+                    metadata = json.loads(group.attrs["metadata"])
+                if metadata is not None:
+                    self.assertIsNone(metadata["year"])
+                    self.assertEqual(metadata["year_mode"], "per_row")
+                    self.assertEqual(metadata["year_range"], [2020, 2021])
+                # exported coordinates keep the per-row years for the next encoder run
+                with np.load(f"{tmpdir}/out_{output_format}.npz") as exported:
+                    np.testing.assert_array_equal(exported["year"], [2021, 2020, 2021])
+
+            with self.assertRaisesRegex(ValueError, "--years"):
+                generator.generate_dataset(
+                    output_path=str(Path(tmpdir) / "conflict"), output_format="pt",
+                    plot_results=False, coordinates_in=coords_path, years=[2020],
+                )
 
     def test_supplied_coordinates_are_never_silently_resampled_when_invalid(self):
         generator = SequenceGenerator(batches=[])

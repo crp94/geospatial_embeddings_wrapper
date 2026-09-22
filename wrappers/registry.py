@@ -26,6 +26,8 @@ ENCODER_REGISTRY = {
     "torchspatial_grid": "wrappers.location_model_encoders:TorchSpatialGridEncoder",
     "torchspatial_theory": "wrappers.location_model_encoders:TorchSpatialTheoryEncoder",
     "torchspatial_rff": "wrappers.location_model_encoders:TorchSpatialRFFEncoder",
+    "terranova": "wrappers.terranova_encoder:TerraNovaEncoder",
+    "terranova_spatial": "wrappers.terranova_encoder:TerraNovaSpatialEncoder",
 }
 
 # Small, model-backed defaults for interactive point queries and examples.  The
@@ -69,6 +71,12 @@ ENCODER_ALIASES = {
     "theory": "torchspatial_theory",
     "torchspatial_rff": "torchspatial_rff",
     "rff": "torchspatial_rff",
+    "terranova": "terranova",
+    "terra_nova": "terranova",
+    "terranova_st": "terranova",
+    "terranova_spatiotemporal": "terranova",
+    "terranova_spatial": "terranova_spatial",
+    "terra_nova_spatial": "terranova_spatial",
 }
 
 

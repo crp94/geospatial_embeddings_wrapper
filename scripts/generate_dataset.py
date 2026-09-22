@@ -46,6 +46,9 @@ from wrappers.embedding_encoder import GeoEmbeddingEncoder
 
 DEFAULT_ENCODERS = ["geoclip", "satclip"]
 ANTARCTICA_LATITUDE_CUTOFF = -60.0
+# Temporal encoders with long year ranges must be constrained with --years rather
+# than silently producing one dataset per year.
+MAX_IMPLICIT_YEARS = 10
 NATURAL_EARTH_LAND_URL = (
     "https://naciscdn.org/naturalearth/{resolution}/physical/ne_{resolution}_land.zip"
 )
@@ -132,8 +135,17 @@ class GeospatialDatasetGenerator:
         print(f"\nActive encoders: {', '.join(self.encoders.keys())}")
         return self.encoders
 
-    def resolve_years(self, requested_years: list[int] | None = None) -> list[int | None]:
-        """Resolve which yearly datasets to generate."""
+    def resolve_years(
+        self,
+        requested_years: list[int] | None = None,
+        per_row_years: np.ndarray | None = None,
+    ) -> list[int | None]:
+        """Resolve which yearly datasets to generate.
+
+        With ``per_row_years`` every supplied coordinate carries its own year, so a
+        single output is produced and each distinct year is validated against the
+        temporal encoders instead of enumerating outputs per year.
+        """
         if requested_years:
             requested = sorted(set(requested_years))
         else:
@@ -144,6 +156,23 @@ class GeospatialDatasetGenerator:
             for name, encoder in self.encoders.items()
             if encoder.is_temporal()
         }
+
+        if per_row_years is not None:
+            if requested:
+                raise ValueError(
+                    "Coordinate input already carries per-row years; do not combine with --years"
+                )
+            for year in np.unique(np.asarray(per_row_years, dtype=np.int64)):
+                unsupported = [
+                    name
+                    for name, encoder in temporal_encoders.items()
+                    if int(year) not in (encoder.get_available_years() or [])
+                ]
+                if unsupported:
+                    raise ValueError(
+                        f"Year {int(year)} is not available for: {', '.join(sorted(unsupported))}"
+                    )
+            return [None]
 
         if not temporal_encoders:
             return requested or [None]
@@ -169,6 +198,12 @@ class GeospatialDatasetGenerator:
             raise RuntimeError(
                 "Selected temporal encoders do not share any common years. "
                 "Pass --years explicitly to constrain the run."
+            )
+        if len(common_years) > MAX_IMPLICIT_YEARS:
+            raise RuntimeError(
+                f"Selected temporal encoders share {len(common_years)} years "
+                f"({common_years[0]}-{common_years[-1]}); refusing to write one dataset "
+                f"per year implicitly (limit {MAX_IMPLICIT_YEARS}). Pass --years explicitly."
             )
         return common_years
 
@@ -292,15 +327,25 @@ class GeospatialDatasetGenerator:
         return None
 
     def get_embeddings(
-        self, latitude: np.ndarray, longitude: np.ndarray, year: int | None = None
+        self,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        year: int | None = None,
+        years: np.ndarray | None = None,
     ) -> tuple[dict[str, np.ndarray], np.ndarray]:
-        """Get embeddings from all initialized encoders and a combined validity mask."""
+        """Get embeddings from all initialized encoders and a combined validity mask.
+
+        ``year`` applies one year to every row; ``years`` supplies one year per row.
+        """
         if not self.encoders:
             raise RuntimeError("No encoders initialized. Call initialize_encoders() first.")
+        if year is not None and years is not None:
+            raise ValueError("Pass either a single year or per-row years, not both")
 
         print(
             f"\nGenerating embeddings for {len(latitude):,} coordinates"
             + (f" for year {year}" if year is not None else "")
+            + (" with per-row years" if years is not None else "")
             + "..."
         )
 
@@ -308,6 +353,8 @@ class GeospatialDatasetGenerator:
             np.column_stack([latitude, longitude]), dtype=torch.float32
         )
         GeoEmbeddingEncoder.validate_coordinates(coordinates)
+        if years is not None:
+            years = GeoEmbeddingEncoder.validate_years(years, len(latitude))
 
         all_embeddings: dict[str, np.ndarray] = {}
         combined_valid = np.ones(len(latitude), dtype=bool)
@@ -325,7 +372,13 @@ class GeospatialDatasetGenerator:
             ):
                 end_idx = min(start_idx + batch_size, len(coordinates))
                 batch_coords = coordinates[start_idx:end_idx]
-                batch_embeddings = encoder.encode(batch_coords, year=year).detach().cpu().float()
+                if years is not None:
+                    batch_embeddings = encoder.encode_with_years(
+                        batch_coords, years[start_idx:end_idx]
+                    )
+                else:
+                    batch_embeddings = encoder.encode(batch_coords, year=year)
+                batch_embeddings = batch_embeddings.detach().cpu().float()
                 batch_valid = encoder.validate_embeddings(batch_embeddings).detach().cpu().numpy()
                 embeddings_list.append(batch_embeddings.numpy())
                 validity_list.append(batch_valid.astype(bool))
@@ -442,6 +495,7 @@ class GeospatialDatasetGenerator:
         longitude: np.ndarray,
         embeddings_dict: dict[str, np.ndarray],
         year: int | None = None,
+        years: np.ndarray | None = None,
     ) -> dict[str, object]:
         """Build the in-memory dataset dictionary with explicit coordinate conventions."""
         coordinates_latlon = np.column_stack([latitude, longitude]).astype(np.float32)
@@ -449,7 +503,7 @@ class GeospatialDatasetGenerator:
 
         dataset: dict[str, object] = {
             "metadata": self._dataset_metadata(
-                n_points=len(latitude), encoder_names=list(embeddings_dict), year=year
+                n_points=len(latitude), encoder_names=list(embeddings_dict), year=year, years=years
             ),
             "longitude": torch.from_numpy(longitude.astype(np.float32)),
             "latitude": torch.from_numpy(latitude.astype(np.float32)),
@@ -458,6 +512,10 @@ class GeospatialDatasetGenerator:
             "coordinates_lonlat": torch.from_numpy(coordinates_lonlat),
         }
 
+        year_column = self._year_column(len(latitude), year, years)
+        if year_column is not None:
+            dataset["year"] = torch.from_numpy(year_column)
+
         for encoder_name, embeddings in embeddings_dict.items():
             dataset[f"{encoder_name}_embeddings"] = torch.from_numpy(
                 embeddings.astype(np.float32)
@@ -465,17 +523,41 @@ class GeospatialDatasetGenerator:
 
         return dataset
 
+    @staticmethod
+    def _year_column(
+        n_points: int, year: int | None, years: np.ndarray | None
+    ) -> np.ndarray | None:
+        """Per-row year array for outputs: explicit per-row years, a broadcast scalar, or none."""
+        if years is not None:
+            return np.asarray(years, dtype=np.int64)
+        if year is not None:
+            return np.full(n_points, int(year), dtype=np.int64)
+        return None
+
     def _dataset_metadata(
-        self, n_points: int, encoder_names: list[str], year: int | None
+        self,
+        n_points: int,
+        encoder_names: list[str],
+        year: int | None,
+        years: np.ndarray | None = None,
     ) -> dict[str, object]:
         """Create serializable provenance shared by every output format."""
+        if years is not None:
+            year_array = np.asarray(years, dtype=np.int64)
+            year_info: dict[str, object] = {
+                "year": None,
+                "year_mode": "per_row",
+                "year_range": [int(year_array.min()), int(year_array.max())],
+            }
+        else:
+            year_info = {"year": year, "year_mode": "static" if year is None else "scalar"}
         return {
             "coordinate_order": {
                 "coordinates": "lat_lon",
                 "coordinates_latlon": "lat_lon",
                 "coordinates_lonlat": "lon_lat",
             },
-            "year": year,
+            **year_info,
             "n_points": int(n_points),
             "encoders": encoder_names,
             "encoder_metadata": {
@@ -502,13 +584,16 @@ class GeospatialDatasetGenerator:
         output_path: str,
         output_format: str,
         year: int | None = None,
+        years: np.ndarray | None = None,
     ) -> str:
         """Persist the dataset to disk."""
         suffix = f"_{year}" if year is not None else ""
         output_prefix = Path(output_path)
         output_prefix.parent.mkdir(parents=True, exist_ok=True)
         if output_format == "pt":
-            dataset = self.build_dataset(latitude, longitude, embeddings_dict, year=year)
+            dataset = self.build_dataset(
+                latitude, longitude, embeddings_dict, year=year, years=years
+            )
             output_file = f"{output_prefix}{suffix}.pt"
             torch.save(dataset, output_file)
             return output_file
@@ -520,52 +605,77 @@ class GeospatialDatasetGenerator:
         for encoder_name, embeddings in embeddings_dict.items():
             for dim_idx in range(embeddings.shape[1]):
                 df_data[f"{encoder_name}_emb_{dim_idx:04d}"] = embeddings[:, dim_idx]
-        if year is not None:
-            df_data["year"] = np.full(len(latitude), year, dtype=np.int32)
+        year_column = self._year_column(len(latitude), year, years)
+        if year_column is not None:
+            df_data["year"] = year_column.astype(np.int32)
 
         output_file = f"{output_prefix}{suffix}.csv"
         pd.DataFrame(df_data).to_csv(output_file, index=False)
         return output_file
 
-    def save_coordinates(self, latitude: np.ndarray, longitude: np.ndarray, path: str) -> str:
-        """Export reusable coordinates in the repository's explicit layout."""
+    def save_coordinates(
+        self,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        path: str,
+        years: np.ndarray | None = None,
+    ) -> str:
+        """Export reusable coordinates (and optional per-row years) in the explicit layout."""
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         coordinates = np.column_stack([latitude, longitude]).astype(np.float32)
+        if years is not None:
+            years = GeoEmbeddingEncoder.validate_years(years, len(latitude))
         if output_path.suffix.lower() == ".csv":
-            pd.DataFrame({"latitude": latitude, "longitude": longitude}).to_csv(
-                output_path, index=False
-            )
+            frame = {"latitude": latitude, "longitude": longitude}
+            if years is not None:
+                frame["year"] = years
+            pd.DataFrame(frame).to_csv(output_path, index=False)
         else:
             if output_path.suffix.lower() != ".npz":
                 output_path = output_path.with_suffix(".npz")
-            np.savez_compressed(
-                output_path,
+            arrays = dict(
                 coordinates=coordinates,
                 coordinates_latlon=coordinates,
                 coordinates_lonlat=coordinates[:, [1, 0]],
                 latitude=latitude.astype(np.float32),
                 longitude=longitude.astype(np.float32),
             )
+            if years is not None:
+                arrays["year"] = years
+            np.savez_compressed(output_path, **arrays)
         return str(output_path)
 
     def load_coordinates(self, path: str) -> tuple[np.ndarray, np.ndarray]:
         """Read explicitly labelled reusable coordinates from npz, pt, or CSV."""
+        latitude, longitude, _ = self.load_coordinates_with_years(path)
+        return latitude, longitude
+
+    def load_coordinates_with_years(
+        self, path: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """Read reusable coordinates plus an optional per-row ``year`` array/column."""
         input_path = Path(path)
         if not input_path.exists():
             raise FileNotFoundError(f"Coordinate input file not found: {input_path}")
         suffix = input_path.suffix.lower()
+        years = None
         if suffix == ".npz":
             with np.load(input_path) as data:
                 coordinates = data.get("coordinates_latlon", data.get("coordinates"))
+                years = data.get("year", data.get("years"))
         elif suffix == ".pt":
             data = torch.load(input_path, map_location="cpu", weights_only=False)
             coordinates = data.get("coordinates_latlon", data.get("coordinates"))
+            years = data.get("year", data.get("years"))
         elif suffix == ".csv":
             data = pd.read_csv(input_path)
             if not {"latitude", "longitude"}.issubset(data.columns):
                 raise ValueError("Coordinate CSV must contain latitude and longitude columns")
             coordinates = data[["latitude", "longitude"]].to_numpy()
+            year_column = next((c for c in ("year", "years") if c in data.columns), None)
+            if year_column is not None:
+                years = data[year_column].to_numpy()
         else:
             raise ValueError("Coordinate input must be .npz, .pt, or .csv")
         if coordinates is None:
@@ -575,7 +685,11 @@ class GeospatialDatasetGenerator:
             dtype=np.float32,
         )
         GeoEmbeddingEncoder.validate_coordinates(torch.from_numpy(coordinates))
-        return coordinates[:, 0], coordinates[:, 1]
+        if years is not None:
+            if isinstance(years, torch.Tensor):
+                years = years.detach().cpu().numpy()
+            years = GeoEmbeddingEncoder.validate_years(np.asarray(years), len(coordinates))
+        return coordinates[:, 0], coordinates[:, 1], years
 
     def save_zarr_dataset(self, n_points: int, output_path: str, year: int | None) -> str:
         """Stream valid batches directly into a chunked Zarr group."""
@@ -628,6 +742,7 @@ class GeospatialDatasetGenerator:
         embeddings_dict: dict[str, np.ndarray],
         output_path: str,
         year: int | None,
+        years: np.ndarray | None = None,
     ) -> str:
         """Write already supplied coordinates to the compatible Zarr schema."""
         try:
@@ -647,6 +762,9 @@ class GeospatialDatasetGenerator:
             "coordinates_lonlat": latlon[:, [1, 0]],
             **{f"{name}_embeddings": values.astype(np.float32) for name, values in embeddings_dict.items()},
         }
+        year_column = self._year_column(len(latitude), year, years)
+        if year_column is not None:
+            arrays["year"] = year_column
         for name, values in arrays.items():
             chunks = (min(100_000, len(latitude)),) + values.shape[1:]
             if hasattr(group, "create_array"):
@@ -654,7 +772,8 @@ class GeospatialDatasetGenerator:
             else:
                 group.create_dataset(name, data=values, chunks=chunks)
         group.attrs["metadata"] = json.dumps(
-            self._dataset_metadata(len(latitude), list(embeddings_dict), year), sort_keys=True
+            self._dataset_metadata(len(latitude), list(embeddings_dict), year, years=years),
+            sort_keys=True,
         )
         return str(output_file)
 
@@ -674,14 +793,17 @@ class GeospatialDatasetGenerator:
         if n_points < 1:
             raise ValueError("n_points must be positive")
         self.initialize_encoders(encoders, device)
-        resolved_years = self.resolve_years(years)
-        provided_coordinates = (
-            self.load_coordinates(coordinates_in) if coordinates_in is not None else None
-        )
-        if provided_coordinates is not None:
-            n_points = len(provided_coordinates[0])
+        provided_coordinates = None
+        per_row_years: np.ndarray | None = None
+        if coordinates_in is not None:
+            latitude_in, longitude_in, per_row_years = self.load_coordinates_with_years(
+                coordinates_in
+            )
+            provided_coordinates = (latitude_in, longitude_in)
+            n_points = len(latitude_in)
             if n_points == 0:
                 raise ValueError("Coordinate input contains no rows")
+        resolved_years = self.resolve_years(years, per_row_years=per_row_years)
 
         output_files: list[str] = []
         for year in resolved_years:
@@ -713,7 +835,9 @@ class GeospatialDatasetGenerator:
                     )
                 else:
                     latitude, longitude = provided_coordinates
-                    embeddings_dict, valid_mask = self.get_embeddings(latitude, longitude, year=year)
+                    embeddings_dict, valid_mask = self.get_embeddings(
+                        latitude, longitude, year=year, years=per_row_years
+                    )
                     if not valid_mask.all():
                         raise RuntimeError(
                             f"{int((~valid_mask).sum())} supplied coordinate(s) are outside "
@@ -722,7 +846,7 @@ class GeospatialDatasetGenerator:
                         )
                 output_file = (
                     self.save_zarr_from_arrays(
-                        latitude, longitude, embeddings_dict, output_path, year
+                        latitude, longitude, embeddings_dict, output_path, year, years=per_row_years
                     )
                     if output_format == "zarr"
                     else self.save_dataset(
@@ -732,10 +856,13 @@ class GeospatialDatasetGenerator:
                         output_path=output_path,
                         output_format=output_format,
                         year=year,
+                        years=per_row_years,
                     )
                 )
                 if coordinates_out is not None and year == resolved_years[0]:
-                    self.save_coordinates(latitude, longitude, coordinates_out)
+                    self.save_coordinates(
+                        latitude, longitude, coordinates_out, years=per_row_years
+                    )
             output_files.append(output_file)
             print(f"[OK] Saved dataset to {output_file}")
 

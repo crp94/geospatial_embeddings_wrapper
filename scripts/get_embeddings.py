@@ -6,7 +6,7 @@ import json
 import sys
 import torch
 import numpy as np
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from pathlib import Path
 
 # Add parent directory to path to import wrappers
@@ -38,26 +38,70 @@ def parse_encoder_roots(values: Iterable[str] | None) -> dict[str, str]:
     return roots
 
 
-def _coordinate_pair(value: Any, context: str) -> tuple[float, float]:
-    """Convert a JSON coordinate item to the standard ``(lat, lon)`` pair."""
+def _coordinate_row(value: Any, context: str) -> tuple[float, float, int | None]:
+    """Convert a JSON coordinate item to ``(lat, lon, year_or_None)``."""
+    year: Any = None
     if isinstance(value, dict):
-        latitude = value.get("lat", value.get("latitude"))
-        longitude = value.get("lon", value.get("longitude"))
+        latitude = value.get("latitude", value.get("lat"))
+        longitude = value.get("longitude", value.get("lon"))
+        year = value.get("year")
         if latitude is None or longitude is None:
             raise ValueError(f"{context} must provide latitude/longitude (or lat/lon) fields")
-    elif isinstance(value, (list, tuple)) and len(value) == 2:
-        latitude, longitude = value
+    elif isinstance(value, (list, tuple)) and len(value) in (2, 3):
+        latitude, longitude = value[0], value[1]
+        if len(value) == 3:
+            year = value[2]
     else:
         raise ValueError(f"{context} must be a [latitude, longitude] pair or mapping")
-
     try:
-        return float(latitude), float(longitude)
+        return float(latitude), float(longitude), _parse_year(year, context)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} contains non-numeric coordinates") from exc
+        raise ValueError(f"{context} has invalid latitude/longitude/year values") from exc
+
+
+def _parse_year(value: Any, context: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{context}: year must be an integer")
+    number = float(value)
+    if not number.is_integer():
+        raise ValueError(f"{context}: year must be an integer")
+    return int(number)
+
+
+def _coordinate_pair(value: Any, context: str) -> tuple[float, float]:
+    """Convert a JSON coordinate item to the standard ``(lat, lon)`` pair."""
+    latitude, longitude, _ = _coordinate_row(value, context)
+    return latitude, longitude
+
+
+def _split_years(rows: list[tuple[float, float, int | None]]):
+    coordinates = [(latitude, longitude) for latitude, longitude, _ in rows]
+    years = [year for _, _, year in rows]
+    present = [year is not None for year in years]
+    if not rows or not any(present):
+        return coordinates, None
+    if not all(present):
+        raise ValueError("Per-row years must be given for every row or none")
+    return coordinates, [int(year) for year in years]
 
 
 def read_coordinates(input_path: str | Path) -> list[tuple[float, float]]:
     """Read JSON, CSV, or whitespace-delimited coordinate files strictly."""
+    coordinates, _ = read_coordinates_with_years(input_path)
+    return coordinates
+
+
+def read_coordinates_with_years(
+    input_path: str | Path,
+) -> tuple[list[tuple[float, float]], list[int] | None]:
+    """Read coordinates plus optional per-row years.
+
+    JSON rows may carry a ``year`` field (or a third list element); JSON array
+    form may carry a top-level ``year`` array; CSV/text may carry a ``year``
+    column.  Years must be present for every row or for none.
+    """
     path = Path(input_path)
     suffix = path.suffix.lower()
     if suffix == ".json":
@@ -70,7 +114,13 @@ def read_coordinates(input_path: str | Path) -> list[tuple[float, float]]:
                 latitudes, longitudes = data["latitude"], data["longitude"]
                 if len(latitudes) != len(longitudes):
                     raise ValueError("JSON latitude and longitude arrays must have the same length")
-                data = list(zip(latitudes, longitudes))
+                years = data.get("year", data.get("years"))
+                if years is None:
+                    data = list(zip(latitudes, longitudes))
+                else:
+                    if len(years) != len(latitudes):
+                        raise ValueError("JSON year array must have the same length as coordinates")
+                    data = list(zip(latitudes, longitudes, years))
             else:
                 raise ValueError(
                     "JSON input must be a coordinate list, contain 'coordinates', "
@@ -78,7 +128,9 @@ def read_coordinates(input_path: str | Path) -> list[tuple[float, float]]:
                 )
         if not isinstance(data, list):
             raise ValueError("JSON coordinates must be a list")
-        return [_coordinate_pair(item, f"JSON coordinate {index + 1}") for index, item in enumerate(data)]
+        return _split_years(
+            [_coordinate_row(item, f"JSON coordinate {index + 1}") for index, item in enumerate(data)]
+        )
 
     if suffix not in {".csv", ".txt"}:
         raise ValueError(f"Unsupported input file format: {suffix or '<none>'}")
@@ -93,9 +145,10 @@ def read_coordinates(input_path: str | Path) -> list[tuple[float, float]]:
             rows.append((line_number, values))
 
     if not rows:
-        return []
+        return [], None
 
     first_line, first_values = rows[0]
+    year_index: int | None = None
     try:
         float(first_values[0])
         float(first_values[1])
@@ -112,19 +165,24 @@ def read_coordinates(input_path: str | Path) -> list[tuple[float, float]]:
             raise ValueError(
                 f"Line {first_line}: expected two numeric columns or lat/lon headers"
             ) from exc
+        year_index = next(
+            (index for index, value in enumerate(normalized_headers) if value in {"year", "years"}),
+            None,
+        )
         rows = rows[1:]
     else:
         latitude_index, longitude_index = 0, 1
 
-    coordinates: list[tuple[float, float]] = []
+    parsed: list[tuple[float, float, int | None]] = []
     for line_number, values in rows:
         try:
-            coordinates.append(
-                (float(values[latitude_index]), float(values[longitude_index]))
+            year = None if year_index is None else _parse_year(values[year_index], f"Line {line_number}")
+            parsed.append(
+                (float(values[latitude_index]), float(values[longitude_index]), year)
             )
         except (IndexError, ValueError) as exc:
-            raise ValueError(f"Line {line_number}: invalid latitude/longitude values") from exc
-    return coordinates
+            raise ValueError(f"Line {line_number}: invalid latitude/longitude/year values") from exc
+    return _split_years(parsed)
 
 
 def validate_coordinates(coordinates: Iterable[tuple[float, float]]) -> torch.Tensor:
@@ -132,6 +190,13 @@ def validate_coordinates(coordinates: Iterable[tuple[float, float]]) -> torch.Te
     return GeoEmbeddingEncoder.validate_coordinates(
         torch.as_tensor(list(coordinates), dtype=torch.float32)
     )
+
+
+def resolve_year_argument(year: Any, n_rows: int) -> np.ndarray | None:
+    """Return a validated per-row year array, or ``None`` for a scalar/absent year."""
+    if year is None or np.ndim(year) == 0:
+        return None
+    return GeoEmbeddingEncoder.validate_years(year, n_rows)
 
 
 class EmbeddingGenerator:
@@ -190,7 +255,7 @@ class EmbeddingGenerator:
         self,
         coordinates: List[tuple],
         return_numpy: bool = False,
-        year: Optional[int] = None,
+        year: Optional[int | Sequence[int]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate embeddings for given coordinates using all active encoders.
@@ -198,16 +263,21 @@ class EmbeddingGenerator:
         Args:
             coordinates: List of (latitude, longitude) tuples
             return_numpy: If True, return numpy arrays instead of torch tensors
+            year: A single year applied to every row, or one year per row
 
         Returns:
             Dictionary mapping encoder names to embedding tensors/arrays
         """
         coords_tensor = validate_coordinates(coordinates)
+        per_row_years = resolve_year_argument(year, coords_tensor.shape[0])
         results = {}
 
         for encoder_name, encoder in self.encoders.items():
             print(f"Generating {encoder_name.upper()} embeddings...")
-            embeddings = encoder.encode(coords_tensor, year=year)
+            if per_row_years is not None:
+                embeddings = encoder.encode_with_years(coords_tensor, per_row_years)
+            else:
+                embeddings = encoder.encode(coords_tensor, year=year)
 
             if not isinstance(embeddings, torch.Tensor):
                 raise TypeError(f"{encoder_name} returned {type(embeddings).__name__}, not a tensor")
@@ -228,7 +298,8 @@ class EmbeddingGenerator:
         self,
         embeddings: Dict[str, torch.Tensor],
         output_path: str,
-        coordinates: Optional[List[tuple]] = None
+        coordinates: Optional[List[tuple]] = None,
+        years: Optional[int | Sequence[int]] = None,
     ):
         """
         Save embeddings to a file.
@@ -237,6 +308,7 @@ class EmbeddingGenerator:
             embeddings: Dictionary of embeddings from generate_embeddings()
             output_path: Path to save the embeddings
             coordinates: Optional list of coordinates to save alongside embeddings
+            years: The year used for every row, or one year per row
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,9 +328,16 @@ class EmbeddingGenerator:
             tensor_embeddings[encoder_name] = tensor
             numpy_embeddings[encoder_name] = tensor.numpy()
 
-        metadata = self._build_metadata(tensor_embeddings, coordinates_tensor)
+        n_rows = next(iter(tensor_embeddings.values())).shape[0] if tensor_embeddings else 0
+        year_array = resolve_year_argument(years, n_rows)
+        if year_array is None and years is not None:
+            year_array = np.full(n_rows, int(years), dtype=np.int64)
+        metadata = self._build_metadata(tensor_embeddings, coordinates_tensor, years)
         npz_payload: dict[str, np.ndarray] = dict(numpy_embeddings)
         pt_payload: dict[str, Any] = dict(tensor_embeddings)
+        if year_array is not None:
+            npz_payload["year"] = year_array
+            pt_payload["year"] = torch.from_numpy(year_array)
         if coordinates_tensor is not None:
             coordinates_lonlat = coordinates_tensor[:, [1, 0]]
             coordinates_np = coordinates_tensor.numpy()
@@ -299,12 +378,25 @@ class EmbeddingGenerator:
         self,
         embeddings: dict[str, torch.Tensor],
         coordinates: torch.Tensor | None,
+        years: Any = None,
     ) -> dict[str, Any]:
         """Create serializable metadata shared by NPZ and Torch outputs."""
+        if years is None:
+            year_info: dict[str, Any] = {"year": None, "year_mode": "static"}
+        elif np.ndim(years) == 0:
+            year_info = {"year": int(years), "year_mode": "scalar"}
+        else:
+            year_array = np.asarray(years, dtype=np.int64)
+            year_info = {
+                "year": None,
+                "year_mode": "per_row",
+                "year_range": [int(year_array.min()), int(year_array.max())],
+            }
         return {
-            "format_version": 2,
+            "format_version": 3,
             "n_points": 0 if coordinates is None else int(coordinates.shape[0]),
             "encoders": list(embeddings),
+            **year_info,
             "coordinate_order": {
                 "coordinates": "lat_lon",
                 "coordinates_latlon": "lat_lon",
@@ -386,7 +478,11 @@ Examples:
     model_group.add_argument(
         "--year",
         type=int,
-        help="Optional year for temporal encoders",
+        nargs="+",
+        help=(
+            "Optional year for temporal encoders: one value applied to every "
+            "coordinate, or exactly one value per coordinate"
+        ),
     )
 
     # Output options
@@ -413,12 +509,13 @@ Examples:
         if len(args.lat) != len(args.lon):
             parser.error("Number of latitude and longitude values must match")
         coordinates = list(zip(args.lat, args.lon))
+        file_years = None
     elif args.input:
         input_path = Path(args.input)
         if not input_path.exists():
             parser.error(f"Input file not found: {args.input}")
         try:
-            coordinates = read_coordinates(input_path)
+            coordinates, file_years = read_coordinates_with_years(input_path)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             parser.error(f"Could not parse {input_path}: {exc}")
 
@@ -427,6 +524,22 @@ Examples:
 
     if not coordinates:
         parser.error("No valid coordinates found")
+
+    year: Any = None
+    if args.year is not None and file_years is not None:
+        parser.error("Input file already carries per-row years; do not combine with --year")
+    if file_years is not None:
+        year = file_years
+    elif args.year is not None:
+        if len(args.year) == 1:
+            year = args.year[0]
+        elif len(args.year) == len(coordinates):
+            year = args.year
+        else:
+            parser.error(
+                f"--year takes one value or one per coordinate ({len(coordinates)}), "
+                f"received {len(args.year)}"
+            )
     try:
         validate_coordinates(coordinates)
         encoder_roots = parse_encoder_roots(args.encoder_root)
@@ -448,7 +561,7 @@ Examples:
 
     # Generate embeddings
     try:
-        embeddings = generator.generate_embeddings(coordinates, year=args.year)
+        embeddings = generator.generate_embeddings(coordinates, year=year)
     except Exception as e:
         print(f"Error generating embeddings: {e}")
         return 1
@@ -468,7 +581,7 @@ Examples:
 
     # Save results if output path provided
     if args.output:
-        generator.save_embeddings(embeddings, args.output, coordinates)
+        generator.save_embeddings(embeddings, args.output, coordinates, years=year)
 
     print("\n[OK] Done!")
     return 0

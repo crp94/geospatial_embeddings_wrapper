@@ -32,3 +32,6 @@ lightning>=2.0.0
 albumentations>=2.0.0
 torchgeo>=0.9.0
 geotessera>=0.7.5
+
+# TerraNova (crp94/terranova on the Hugging Face Hub; package is not on PyPI)
+terranova @ git+https://github.com/crp94/terranova-model
